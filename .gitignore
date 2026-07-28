@@ -2,3 +2,6 @@ __pycache__
 .venv
 .env
 payload.json
+
+# Estado de sessão do Playwright — contém credenciais reais. NUNCA commitar.
+.auth/
