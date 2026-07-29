@@ -5,8 +5,24 @@ description = "Estimador de preços do Azure com autenticação via Entra ID (MS
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "httpx>=0.28.1",
     "msal>=1.37.0",
     "playwright>=1.61.0",
+    "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "requests>=2.34.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["mcp-server/tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: testes que batem na API real (pulados sem rede)",
 ]

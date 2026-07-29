@@ -5,3 +5,6 @@ payload.json
 
 # Estado de sessão do Playwright — contém credenciais reais. NUNCA commitar.
 .auth/
+
+instrucao_fase_1.md
+PROGRESS.md
