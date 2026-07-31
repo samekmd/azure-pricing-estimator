@@ -1,0 +1,94 @@
+# Padrão de arquitetura: Web App em Três Camadas
+#
+# STATUS: totalmente resolvível. Os 3 serviços usados (vm, storage, sql)
+# já têm resolver em mcp-server/src/azure_estimator_mcp/azure/meters.py, com
+# os mesmos valores testados em test_resolve_integration.py.
+# assim que a tool resolve_price existir de ponta a ponta (Fase 2), este
+# padrão já deve fechar uma estimativa real sem ajuste nenhum.
+#
+# Esquema (rascunho, ainda não fixado em SKILL.md, alinhar com André e Samuel):
+#   pattern.match.keywords -> usado pela Skill (Fase 3) para casar a descrição
+#     em linguagem natural do arquiteto com este padrão antes de cair no
+#     fallback de extração via LLM.
+#   components[].service   -> chave que bate com RESOLVERS em meters.py.
+#   components[].config    -> passado direto para o resolver do serviço.
+#   components[].usage     -> passado direto para monthly_cost(); campos
+#     omitidos usam os defaults do próprio monthly_cost (ex.: hours=730).
+#   components[].quantity  -> multiplicador de instâncias idênticas. Ainda NÃO
+#     existe lógica que aplique isso automaticamente (create_estimate/
+#     add_line_item são Fase 2), por enquanto é só metadado documentando a
+#     intenção; quem consumir o padrão soma manualmente até isso existir.
+
+pattern:
+  id: three-tier-web-app
+  name: "Web App em Três Camadas"
+  description: >
+    Aplicação web clássica dividida em três camadas: apresentação (servidores
+    web), lógica de aplicação (servidores de app) e dados (banco relacional
+    gerenciado). Inclui armazenamento para arquivos estáticos e uploads.
+  match:
+    keywords:
+      - "aplicação web"
+      - "site com banco de dados"
+      - "três camadas"
+      - "arquitetura três camadas"
+      - "web app tradicional"
+      - "frontend, backend e banco"
+
+components:
+  - id: web-tier
+    role: "Camada de apresentação (servidores web, Linux)"
+    service: vm
+    quantity: 2
+    config:
+      armSkuName: Standard_D2s_v3
+      region: East US
+      windows: false
+      priceType: Consumption
+    usage:
+      hours: 730  # ligado o mês inteiro
+
+  - id: app-tier
+    role: "Camada de aplicação (lógica de negócio, Linux)"
+    service: vm
+    quantity: 2
+    config:
+      armSkuName: Standard_D2s_v3
+      region: East US
+      windows: false
+      priceType: Consumption
+    usage:
+      hours: 730
+
+  - id: data-tier
+    role: "Banco de dados relacional gerenciado"
+    service: sql
+    quantity: 1
+    config:
+      region: East US
+      tier: General Purpose
+      compute: Provisioned
+      hardware: Gen5
+      vCores: 2
+      priceType: Consumption
+    usage: {}  # meter é "1 Hour" -> usa default de 730h/mês
+
+  - id: static-assets
+    role: "Armazenamento de arquivos estáticos e uploads"
+    service: storage
+    quantity: 1
+    config:
+      region: East US
+      redundancy: LRS
+      tier: Hot
+      priceType: Consumption
+    usage:
+      gb: 500  # estimativa inicial de volume armazenado, editável
+
+notes: >
+  Premissas assumidas, para ficarem visíveis e editáveis por quem for usar o
+  padrão: 2x VM D2s_v3 Linux em cada camada de compute (web e app), banco
+  General Purpose Gen5 2 vCores, storage Hot/LRS com 500GB. Região default
+  East US só porque é a combinação já validada em
+  test_resolve_integration.py — trocar por Brazil South (ou outra) é
+  suportado, mas ainda não testado contra a API real para esses SKUs.
