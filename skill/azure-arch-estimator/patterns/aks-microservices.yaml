@@ -1,0 +1,72 @@
+# Padrão de arquitetura: Microsserviços em AKS
+#
+# STATUS: PARCIALMENTE BLOQUEADO. database e shared-storage usam o
+# vocabulário real de meters.py (sql, storage) e são resolvíveis hoje. 
+# O node-pool também é resolvível hoje (nodes do AKS são VMs normais,
+# cobradas por vCore/hora como qualquer VM — reaproveita o resolver "vm").
+# O que falta é o control-plane-sla: a taxa do SLA do control plane
+# gerenciado (serviceName "Azure Kubernetes Service" na Retail Prices API)
+# não tem resolver ainda em meters.py.
+
+pattern:
+  id: aks-microservices
+  name: "Microsserviços em AKS"
+  description: >
+    Aplicação de microsserviços rodando em cluster Azure Kubernetes Service
+    (AKS), com banco de dados gerenciado e armazenamento compartilhado para
+    artefatos, imagens de container e logs.
+  match:
+    keywords:
+      - "microsserviços"
+      - "microservices"
+      - "kubernetes"
+      - "aks"
+      - "containers"
+      - "arquitetura de containers"
+
+components:
+  - id: node-pool
+    role: "Node pool do cluster (VMs que executam os pods)"
+    service: vm  # nodes AKS são VMs normais 
+    quantity: 3
+    config:
+      armSkuName: Standard_D4s_v3
+      region: East US
+      windows: false
+      priceType: Consumption
+    usage:
+      hours: 730
+
+  - id: control-plane-sla
+    role: "SLA do control plane gerenciado (camada Standard/paga)"
+    service: aks  # TODO(bloqueado): resolver "aks" não existe em meters.py ainda
+    quantity: 1
+    config:
+      region: East US
+      tier: Standard  
+    usage: {}
+
+  - id: database
+    role: "Banco de dados gerenciado"
+    service: sql
+    quantity: 1
+    config:
+      region: East US
+      tier: General Purpose
+      compute: Provisioned
+      hardware: Gen5
+      vCores: 2
+      priceType: Consumption
+    usage: {}
+
+  - id: shared-storage
+    role: "Armazenamento compartilhado (artefatos, imagens, logs)"
+    service: storage
+    quantity: 1
+    config:
+      region: East US
+      redundancy: LRS
+      tier: Hot
+      priceType: Consumption
+    usage:
+      gb: 200

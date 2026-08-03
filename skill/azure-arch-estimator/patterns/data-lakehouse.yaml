@@ -1,0 +1,52 @@
+# Padrão de arquitetura: Data Lakehouse (Azure-native)
+#
+# Motor de consulta/processamento Azure Synapse Analytics (serverless
+# SQL pool): serviço Azure nativo, de preço público
+#
+# STATUS: parcialmente bloqueado, data-lake-storage já resolve hoje. 
+# synapse-serverless-sql ainda não tem resolver em meters.py
+
+pattern:
+  id: data-lakehouse
+  name: "Data Lakehouse (Azure-native)"
+  description: >
+    Arquitetura de dados em camadas (medalhão: Bronze/Silver/Gold) usando
+    apenas serviços Azure nativos de preço público: Data Lake (ADLS Gen2)
+    para armazenamento e Azure Synapse Analytics (serverless SQL pool) como
+    motor de consulta/processamento sobre os dados. Sem Databricks.
+  match:
+    keywords:
+      - "data lake"
+      - "lakehouse"
+      - "synapse"
+      - "bronze silver gold"
+      - "medalhão"
+      - "pipeline de dados"
+      - "arquitetura de dados"
+
+components:
+  - id: data-lake-storage
+    role: "Data Lake (ADLS Gen2) — camadas Bronze/Silver/Gold"
+    service: storage
+    quantity: 1
+    config:
+      region: East US
+      redundancy: LRS
+      tier: Hot
+      priceType: Consumption
+    usage:
+      gb: 1000  # estimativa inicial de volume armazenado, editável
+
+  - id: synapse-serverless-sql
+    role: "Motor de consulta/processamento (T-SQL sob demanda sobre o data lake)"
+    service: synapse  # TODO(bloqueado): resolver "synapse" não existe em meters.py ainda
+    quantity: 1
+    config:
+      # Rascunho a confirmar contra a Retail Prices API quando o resolver
+      # existir. serviceName provável: "Azure Synapse Analytics". Serverless
+      # SQL pool é cobrado por TB processado, não por hora fixa — por isso o
+      # "usage" abaixo é volume consultado/mês, não horas.
+      region: East US
+      tier: "Serverless SQL Pool"
+    usage:
+      tbProcessed: 5  # estimativa inicial de volume consultado/mês, editável
