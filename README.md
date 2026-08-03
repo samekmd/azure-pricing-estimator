@@ -112,8 +112,8 @@ make bootstrap-login
 | Fase | Descrição                                                                       |     Status      |
 | :--: | ------------------------------------------------------------------------------- | :-------------: |
 |  0   | Autenticação — spike do endpoint de save, Playwright, sessão persistida         |  ✅ concluída   |
-|  1   | Núcleo de preço — Retail Prices API, `config → meter`, `resolve_price` + testes | 🔄 em andamento |
-|  2   | MCP mínimo — as 6 tools + fatia vertical (descrição → link) no Claude Code      |  ⏳ planejada   |
+|  1   | Núcleo de preço — Retail Prices API, `config → meter`, `resolve_price` + testes |  ✅ concluída   |
+|  2   | MCP mínimo — as 6 tools + fatia vertical (descrição → link) no Claude Code      |  🔄 em andamento|
 |  3   | Skill — biblioteca de padrões, interpretação e validação                        |  ⏳ planejada   |
 |  4   | Integração e entrega — teste ponta a ponta, robustez, demo                      |  ⏳ planejada   |
 
