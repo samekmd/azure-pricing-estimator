@@ -97,15 +97,12 @@ azure-pricing-estimator/
 ## Setup
 
 ```bash
-# 1. Dependências
-uv sync
+# 1. Dependências + navegador do Playwright (wraps `uv sync` + `uv run playwright install chromium`)
+make install
 
-# 2. Navegador do Playwright (uma vez)
-uv run playwright install chromium
-
-# 3. Login manual — abre um Chromium visível; faça login (com MFA) e pressione Enter.
+# 2. Login manual — abre um Chromium visível; faça login (com MFA) e pressione Enter.
 #    Salva a sessão em .auth/storage_state.json
-uv run python mcp-server/scripts/bootstrap_login.py
+make bootstrap-login
 ```
 
 > A sessão expira depois de um tempo. Quando `is_authenticated()` retornar `False`, basta rodar o bootstrap de novo. Não há auto-refresh — é intencional.
