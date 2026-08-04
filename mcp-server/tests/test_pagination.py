@@ -34,7 +34,9 @@ async def test_single_page():
 async def test_follows_next_page_link():
     page2_url = f"{BASE_URL}?api-version=x&$skip=1000"
     route = respx.get(BASE_URL)
-    # 1ª chamada (com params) -> página cheia + NextPageLink; 2ª (link) -> fim.
+    # 1ª chamada -> página cheia + NextPageLink; 2ª (via $skip) -> fim. O link em
+    # si é ignorado: o avanço vem de $skip, mas a resposta que o traz não pode
+    # quebrar a paginação.
     route.side_effect = [
         _page(_items(PAGE_SIZE), next_link=page2_url),
         _page(_items(5, start=PAGE_SIZE)),
@@ -65,6 +67,37 @@ async def test_empty_next_link_workaround_uses_skip():
     assert len(items) == 2 * PAGE_SIZE + 7
     # Confirma que o contorno incrementou $skip corretamente.
     assert calls["skips"] == [None, str(PAGE_SIZE), str(2 * PAGE_SIZE)]
+
+
+@respx.mock
+async def test_mixed_link_and_empty_link_no_duplicates():
+    """Caso MISTO: página com NextPageLink seguida de página cheia SEM link.
+
+    Regressão do bug em que o contador de $skip só avançava no ramo do contorno:
+    a posição real (já adiantada pelo link) ficava dessincronizada e o cliente
+    repetia $skip=1000, duplicando 1000 itens.
+    """
+    skips = []
+
+    def responder(request):
+        skip = request.url.params.get("$skip")
+        skips.append(skip)
+        if skip is None:  # 1ª página: cheia, COM NextPageLink
+            return _page(_items(PAGE_SIZE), next_link=f"{BASE_URL}?$skip={PAGE_SIZE}")
+        if skip == str(PAGE_SIZE):  # 2ª página: cheia, SEM link
+            return _page(_items(PAGE_SIZE, start=PAGE_SIZE), next_link=None)
+        # 3ª página: parcial -> fim.
+        return _page(_items(3, start=int(skip)), next_link=None)
+
+    respx.get(BASE_URL).mock(side_effect=responder)
+    async with RetailPricesClient() as c:
+        items = await c.query_prices({"serviceName": "Virtual Machines"})
+
+    ids = [it["meterId"] for it in items]
+    assert len(ids) == len(set(ids))  # nenhuma duplicata
+    assert len(items) == 2 * PAGE_SIZE + 3  # 2003 itens
+    assert skips == [None, str(PAGE_SIZE), str(2 * PAGE_SIZE)]
+    assert len(skips) == len(set(skips))  # nenhum $skip requisitado duas vezes
 
 
 @respx.mock

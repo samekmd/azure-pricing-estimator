@@ -121,43 +121,32 @@ class RetailPricesClient:
     ) -> list[dict]:
         """Consulta todos os itens que casam com `filters`, com paginação completa.
 
-        Segue NextPageLink quando presente; MAS há um bug conhecido em que o link
-        volta vazio. Contorno: se a página veio cheia (PAGE_SIZE itens), geramos a
-        próxima nós mesmos com $skip incrementado, até vir menos que PAGE_SIZE.
+        A paginação é dirigida SEMPRE por $skip, derivado do total de itens já
+        acumulados — nunca por NextPageLink. O link é conhecido por voltar vazio
+        de forma intermitente; usá-lo como controle de fluxo criava dois modos de
+        avanço (link e $skip) que dessincronizavam entre si e refaziam páginas.
+        Com uma fonte única de verdade (`len(items)`), a mistura deixa de existir.
+
+        Condição de parada: página com menos de PAGE_SIZE itens.
         """
         odata_filter = build_filter(filters)
-        params = {
+        base_params = {
             "api-version": API_VERSION,
             "currencyCode": currency,
             "$filter": odata_filter,
         }
 
         items: list[dict] = []
-        skip = 0
-        url: str | None = BASE_URL
-        # Na primeira chamada usamos params; ao seguir NextPageLink, a URL já
-        # traz a query string, então params vira None.
-        current_params: dict[str, str] | None = params
+        while True:
+            params = dict(base_params)
+            if items:
+                # A primeira chamada vai sem $skip; as seguintes retomam
+                # exatamente de onde a anterior parou.
+                params["$skip"] = str(len(items))
 
-        while url is not None:
-            data = await self._get(url, current_params)
+            data = await self._get(BASE_URL, params)
             page = data.get("Items", [])
             items.extend(page)
 
-            next_link = data.get("NextPageLink")
-            if next_link:
-                url = next_link
-                current_params = None
-                continue
-
-            # Sem NextPageLink: só continuamos se a página veio cheia (contorno
-            # do bug). Página incompleta => acabou de verdade.
-            if len(page) == PAGE_SIZE:
-                skip += PAGE_SIZE
-                url = BASE_URL
-                current_params = {**params, "$skip": str(skip)}
-                continue
-
-            url = None
-
-        return items
+            if len(page) < PAGE_SIZE:
+                return items
