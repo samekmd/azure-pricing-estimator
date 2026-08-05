@@ -117,7 +117,7 @@ class RetailPricesClient:
         raise last_exc
 
     async def query_prices(
-        self, filters: dict[str, str], currency: str = "USD"
+        self, filters: dict[str, str], currency: str = "USD", top: int | None = None
     ) -> list[dict]:
         """Consulta todos os itens que casam com `filters`, com paginação completa.
 
@@ -128,6 +128,10 @@ class RetailPricesClient:
         Com uma fonte única de verdade (`len(items)`), a mistura deixa de existir.
 
         Condição de parada: página com menos de PAGE_SIZE itens.
+
+        `top` limita a consulta a N itens (sondas baratas de descoberta): manda
+        $top para a API e trunca localmente, então o limite vale mesmo quando a
+        API ignora o parâmetro.
         """
         odata_filter = build_filter(filters)
         base_params = {
@@ -135,6 +139,8 @@ class RetailPricesClient:
             "currencyCode": currency,
             "$filter": odata_filter,
         }
+        if top is not None:
+            base_params["$top"] = str(min(top, PAGE_SIZE))
 
         items: list[dict] = []
         while True:
@@ -148,5 +154,7 @@ class RetailPricesClient:
             page = data.get("Items", [])
             items.extend(page)
 
+            if top is not None and len(items) >= top:
+                return items[:top]
             if len(page) < PAGE_SIZE:
                 return items
