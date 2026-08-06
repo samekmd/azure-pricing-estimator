@@ -42,14 +42,17 @@ make bootstrap-login
 Two independent, deliberately decoupled subsystems live under
 `mcp-server/src/azure_estimator_mcp/azure/`:
 
-1. **Pricing lookup (`retail_client.py`, `meters.py`, `pricing.py`)** — pure
-   HTTP (`httpx`), no browser, queries the public, unauthenticated Azure
-   Retail Prices API (`https://prices.azure.com/api/retail/prices`).
+1. **Pricing lookup (`retail_client.py`, `meters.py`, `pricing.py`,
+   `catalog.py`)** — pure HTTP (`httpx`), no browser, queries the public,
+   unauthenticated Azure Retail Prices API
+   (`https://prices.azure.com/api/retail/prices`).
    - `retail_client.py`: `RetailPricesClient` handles pagination and
-     429/5xx retry with exponential backoff. Note the pagination workaround —
-     `NextPageLink` is known to come back empty, so when a page comes back
-     full (`PAGE_SIZE=1000`), the client manually increments `$skip` instead
-     of trusting the link.
+     429/5xx retry with exponential backoff. Pagination is driven **only** by
+     `$skip`, always derived from `len(items)` accumulated so far, stopping on
+     a page shorter than `PAGE_SIZE=1000`; `NextPageLink` is never used as
+     flow control (it comes back empty intermittently, and mixing the two
+     modes desynchronized the counter and re-fetched pages). `top=N` caps a
+     query for cheap discovery probes.
    - `meters.py`: one resolver per service (`resolve_vm`, `resolve_storage`,
      `resolve_sql`, registered in `RESOLVERS`). Each resolver returns
      `(odata_filters, select_fn)`: filters narrow the API query server-side,
@@ -63,6 +66,13 @@ Two independent, deliberately decoupled subsystems live under
      projects unit price to a monthly cost based on `unit_of_measure` — add
      new unit mappings here rather than guessing at unrecognized units
      (unrecognized units raise `ValueError` by design).
+   - `catalog.py`: discovery layer behind the `search_azure_services` and
+     `get_service_config_schema` tools. `_CATALOG` maps each `RESOLVERS` key to
+     the exact API `serviceName`, pt-BR/en aliases and a cheap probe filter;
+     valid values come from live API probes cached in-memory by TTL
+     (`CACHE_TTL_SECONDS`, 6h — call `clear_cache()` in tests). It describes
+     what the resolvers consume; it must not resolve prices or pick meters.
+     When adding a resolver to `meters.py`, add its entry + field builder here.
 
 2. **Calculator automation (`calculator_client.py`,
    `scripts/bootstrap_login.py`)** — Playwright-driven browser automation

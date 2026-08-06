@@ -1,8 +1,10 @@
 """Servidor MCP do estimador de preços do Azure.
 
-resolve_price e estimate_monthly_cost estão ligados à implementação real em
-azure/pricing.py. Os outros 4 tools seguem como stubs — dependem de
-azure/calculator_client.py, que ainda é Fase 2.
+As tools de descoberta (search_azure_services, get_service_config_schema) e de
+preço (resolve_price, estimate_monthly_cost) estão ligadas à implementação real
+em azure/catalog.py e azure/pricing.py — aqui elas são só adaptadores: traduzem
+argumentos, chamam a função e serializam. Os outros 4 tools seguem como stubs —
+dependem de azure/calculator_client.py, que ainda é Fase 2.
 """
 
 from __future__ import annotations
@@ -11,10 +13,47 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from .azure.catalog import DEFAULT_REGION, DEFAULT_SAMPLE
+from .azure.catalog import config_schema as _config_schema
+from .azure.catalog import search_services as _search_services
 from .azure.pricing import monthly_cost as _monthly_cost
 from .azure.pricing import resolve_price as _resolve_price
 
 mcp = MCPServer("azure-pricing-estimator")
+
+
+@mcp.tool()
+async def search_azure_services(
+    query: str, currency: str = "USD"
+) -> list[dict[str, Any]]:
+    """Encontra serviços Azure a partir de um termo em linguagem natural.
+
+    Devolve, para cada candidato, o `service_name` EXATO da Retail Prices API, a
+    `key` a ser usada em resolve_price/get_service_config_schema, um rótulo e a
+    família do serviço. Termo sem correspondência devolve lista vazia.
+    """
+    matches = await _search_services(query, currency=currency)
+    return [m.model_dump() for m in matches]
+
+
+@mcp.tool()
+async def get_service_config_schema(
+    service: str,
+    region: str = DEFAULT_REGION,
+    currency: str = "USD",
+    sample_size: int = DEFAULT_SAMPLE,
+) -> dict[str, Any]:
+    """Campos de config que um serviço espera, com os valores válidos da API.
+
+    `service` aceita a key ('vm'), o serviceName ('Virtual Machines') ou um
+    alias. Enumerações grandes vêm recortadas: amostra + total + a consulta da
+    API que produz a lista completa. O `example_config` devolvido já é uma config
+    aceita por resolve_price.
+    """
+    schema = await _config_schema(
+        service, region=region, currency=currency, sample_size=sample_size
+    )
+    return schema.model_dump()
 
 
 @mcp.tool()
