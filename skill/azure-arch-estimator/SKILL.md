@@ -14,7 +14,9 @@ description: >
 > RASCUNHO (Fase 1/2). Este arquivo cobre o fluxo mínimo hoje possível:
 > interpretar → resolver preço → montar estimativa local. A geração do link
 > real da calculadora (`create_estimate` / `add_line_item` / `export_estimate`)
-> ainda é stub — ver "Limitações atuais" no fim do arquivo. Os arquivos
+> já tem lógica real em `calculator_client.py` (Playwright), mas os tools
+> correspondentes em `server.py` ainda não foram ligados a ela — ver
+> "Limitações atuais" no fim do arquivo. Os arquivos
 > `reference/interpretation-guide.md` e `reference/validation-rules.md`
 > (Fase 3) vão aprofundar as regras de casamento de padrão e validação;
 > aqui fica só o essencial para já testar a fatia vertical.
@@ -26,10 +28,11 @@ de dados", esta Skill guia o agente (Claude Code) a:
 
 1. Tentar casar o pedido com um dos padrões em `patterns/` (determinístico,
    por palavra-chave).
-2. Se nenhum padrão casar, extrair os componentes da descrição por conta
-   própria (raciocínio do agente), mas **só usando os serviços que já têm
-   resolver implementado** (ver tabela abaixo) — não inventar componentes
-   fora do vocabulário conhecido.
+2. Se nenhum padrão casar, descobrir os componentes via `search_azure_services`
+   e `get_service_config_schema` em vez de adivinhar (ver passo 2 do fluxo) —
+   hoje isso ainda cobre só os serviços com resolver implementado (`vm`,
+   `storage`, `sql`), então qualquer coisa fora dessas três continua
+   sinalizada como bloqueada.
 3. Para cada componente, chamar as tools do MCP `azure-pricing-estimator`
    para resolver preço e projetar custo mensal.
 4. Somar os custos e apresentar a estimativa ao usuário em uma tabela,
@@ -54,22 +57,72 @@ Se nenhum padrão casar, vá para o passo 2 (fallback).
 
 ### 2. Fallback — extrair componentes sem padrão
 
-Quando não houver casamento por keyword, raciocine sobre a descrição do
-usuário e monte uma lista de componentes no mesmo formato usado pelos
-padrões (`service`, `config`, `usage`, `quantity`). Regras:
+Quando não houver casamento por keyword, não adivinhe: use as tools de
+descoberta do MCP para confirmar cada componente contra a API antes de
+montar a config.
 
-- Só use `service` dentre os que têm resolver implementado hoje: `vm`,
-  `storage`, `sql` (ver tabela abaixo). Se a descrição exigir um serviço
-  sem resolver (ex.: AKS, Synapse — ver "Serviços bloqueados"), sinalize
-  isso ao usuário em vez de tentar adivinhar uma config.
-- Preencha os campos obrigatórios de cada serviço (ver tabela); campos
-  opcionais podem usar os defaults do próprio resolver (documentados
-  abaixo) em vez de inventar valores.
-- Quando a descrição não especificar volume/região/tamanho, adote os
-  mesmos defaults usados pelos padrões de referência (região `East US`,
-  já validada em `test_resolve_integration.py`) e deixe isso explícito
-  para o usuário como premissa assumida — igual ao campo `notes` dos
-  padrões.
+1. **Descobrir o serviço.** Para cada componente da descrição, chame:
+
+   ```
+   search_azure_services(query, currency="USD") -> list[ServiceMatch]
+   ```
+
+   Passe o termo mais literal possível (ex.: "kubernetes", "fila de
+   mensagens", "banco de dados"). A tool devolve, ordenados por
+   relevância, os serviços cujo `serviceName` foi confirmado por uma
+   sonda real na API — cada `ServiceMatch` traz `key` (a chave que
+   `resolve_price`/`get_service_config_schema` esperam), `service_name`
+   exato, `label`, `service_family` e `matched_on` (o termo do catálogo
+   que casou, útil para entender por que aquele serviço apareceu).
+
+   - **Lista vazia** = a API não confirma nenhum serviço para esse termo
+     dentro do catálogo hoje (que cobre só `vm`, `storage`, `sql` — ver
+     "Serviços bloqueados"). Trate como bloqueado e sinalize ao usuário;
+     não invente uma `key` fora do que a tool devolveu.
+   - **Um resultado** → use a `key` dele.
+   - **Mais de um resultado** → use o primeiro (maior score); se a
+     descrição do usuário for ambígua a ponto de você não ter confiança
+     de qual serviço ele quer, pergunte antes de seguir em vez de
+     chutar.
+
+2. **Descobrir os campos de config.** Com a `key` (ou o `service_name`)
+   em mãos, chame:
+
+   ```
+   get_service_config_schema(service, region, currency="USD") -> ServiceConfigSchema
+   ```
+
+   Use a região que o usuário pediu, ou o default `East US` se ele não
+   especificar (mesma regra do passo 4). A resposta já traz:
+
+   - `fields`: lista de `FieldSchema` — nome, tipo, `required`,
+     descrição, `default`, uma amostra de `values` válidos direto da
+     API, `value_count` (total real de valores distintos) e
+     `values_source` (a query que gerou a lista, para buscar o valor
+     completo se precisar de algo fora da amostra);
+   - `example_config`: uma config já pronta e aceita por `resolve_price`
+     — use como ponto de partida em vez de montar do zero;
+   - `notes`: avisos específicos do serviço que não cabem num campo
+     isolado — ex.: variantes descartadas pelo resolver (Spot/Low
+     Priority em VM), a unidade de `usage` esperada por
+     `estimate_monthly_cost`, ou combinações que tendem a gerar
+     `PriceResolutionError` (ex.: SQL sem `vCores` costuma sobrar mais
+     de um meter). Leia antes de montar a config, não só `fields`/
+     `example_config`.
+
+3. **Montar a config final.** Parta do `example_config` e sobrescreva só
+   o que o usuário efetivamente pediu (região, tamanho de VM, tier
+   etc.). Para os campos obrigatórios que ele não mencionou, use o
+   `default` do próprio `FieldSchema` quando existir; se não houver
+   default e o campo for obrigatório, escolha um valor dentro dos
+   `values` retornados (nunca fora da amostra/API) e deixe isso
+   explícito ao usuário como premissa assumida — igual ao campo `notes`
+   dos padrões.
+
+> A tabela em "Serviços suportados hoje" abaixo continua útil como
+> referência rápida offline, mas em runtime a fonte de verdade passa a
+> ser `get_service_config_schema`, direto da API — se ela e a tabela
+> divergirem, a tool vence.
 
 ### 3. Resolver preço de cada componente
 
@@ -99,7 +152,9 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
 - Deixe explícitas as premissas assumidas (região, tamanho de VM, volume de
   storage etc.), do mesmo jeito que o campo `notes` faz nos padrões.
 - Informe que o resultado é uma **estimativa local**, não ainda um link da
-  calculadora Azure (isso depende da Fase 2 do André — ver limitações).
+  calculadora Azure — a lógica de `create_estimate`/`add_line_item`/
+  `export_estimate` já existe em `calculator_client.py`, mas os tools do
+  MCP ainda não foram ligados a ela (ver limitações).
 
 ## Serviços suportados hoje
 
@@ -154,9 +209,12 @@ mas siga precificando o restante da arquitetura normalmente.
 
 ## Limitações atuais
 
-- `export_estimate`, `create_estimate` e `add_line_item` ainda são stubs no
-  MCP (Fase 2 do André, dependem de `calculator_client.py` real via
-  Playwright) — hoje a Skill só consegue montar uma **estimativa local**
+- `check_calculator_auth`, `create_estimate`, `add_line_item` e
+  `export_estimate` continuam levantando `NotImplementedError` em
+  `server.py` — mas a lógica real (Playwright) já existe nos métodos
+  correspondentes de `AzureCalculatorClient`, em `calculator_client.py`.
+  Falta só ligar os tools do MCP a ela (wiring), não implementar do zero.
+  Até isso acontecer, a Skill só consegue montar uma **estimativa local**
   (soma de custos calculados), não gerar o link oficial da calculadora.
 - `quantity` dos componentes não é somado automaticamente por nenhuma tool
   — a soma é feita pela Skill na hora de apresentar o resultado (passo 4).
