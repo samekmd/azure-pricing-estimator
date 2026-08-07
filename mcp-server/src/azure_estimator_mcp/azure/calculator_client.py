@@ -4,8 +4,9 @@ Reutiliza o estado de sessão salvo pelo scripts/bootstrap_login.py para dirigir
 a UI da calculadora já autenticado — a autenticação é delegada a um navegador
 real (o jeito que a Microsoft desenhou: cookie + CSRF de uma sessão de verdade).
 
-Este módulo contém apenas a BASE de autenticação. A montagem da estimativa e a
-captura do link de compartilhamento são da Fase 2 (stubs abaixo).
+Os seletores usados abaixo foram mapeados ao vivo (DOM real, sessão
+autenticada) em 06/08. Preferência de estabilidade: `data-testid` > `name`/
+`id` de campo > classe Fluent UI (hash, evitada sempre que possível).
 """
 
 from __future__ import annotations
@@ -16,11 +17,78 @@ from typing import Any
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
 CALCULATOR_URL = "https://azure.microsoft.com/en-us/pricing/calculator/"
+
+# Serviço (chave de RESOLVERS em meters.py / _CATALOG em catalog.py) -> testid
+# do botão "Add to estimate" no product picker. Cada testid aparece 2x no DOM
+# (aba "Popular" + aba da categoria própria) — só uma cópia fica visível por
+# vez, por isso o seletor sempre filtra `:visible`.
+_PICKER_TESTIDS: dict[str, str] = {
+    "vm": "virtual-machines-picker-item",
+    "storage": "storage-picker-item",
+    "sql": "azure-sql-database-picker-item",
+}
+
+# Campos de config que são <select name="..."> simples dentro do painel do
+# item já adicionado — mapeáveis direto por select_option(label=...). Campos
+# fora dessa lista (busca de instância/tamanho, quantidade, radios de
+# billing) usam widgets custom (combobox com busca, grupos de radio cujo
+# `name` embute um GUID por item) que ainda não foram mapeados; ver
+# add_line_item().
+_SIMPLE_SELECT_FIELDS: dict[str, set[str]] = {
+    "vm": {"region", "operatingSystem", "type", "tier", "category"},
+    "storage": {
+        "region",
+        "type",
+        "performanceTier",
+        "storageAccountType",
+        "fileStructure",
+        "accessTier",
+        "redundancy",
+    },
+    "sql": {
+        "region",
+        "type",
+        "purchaseModel",
+        "vcoreTier",
+        "computeTier",
+        "generation",
+        "instanceSize",
+        "zoneRedundancy",
+    },
+}
+
+# Campos de texto simples (<input>, sem widget de busca) do painel de VM.
+# "count"/"hours" têm name= e id= iguais; select_option cobre a unidade.
+_VM_TEXT_INPUT_FIELDS = {"count", "hours"}
+
+# O campo INSTANCE (#size) é um combobox com busca (react-select) — digitar
+# filtra e abre um <div role="option"> com o texto completo do SKU (ex.:
+# "D4s v3: 4 vCPUs, 16 GB RAM, ..., $0.376/hour"); precisa digitar algo
+# específico o bastante pra sobrar 1 opção, senão o `.first` pode escolher
+# a sugestão errada.
+_VM_SIZE_FIELD = "size"
+
+# Radios de billing: o `name`/`id` real embute um GUID por item
+# (radio-<prefixo>-<GUID>-computeBillingOption), então localizamos pelo
+# prefixo estável do id, não pelo texto do label (o label de savings plan
+# inclui um "~X% discount" que varia por SKU/região).
+_VM_COMPUTE_BILLING_PREFIXES = {
+    "payg": "radio-payg-",  # Pay as you go
+    "savings_1yr": "radio-sv-one-year-",  # 1 year savings plan
+    "savings_3yr": "radio-sv-three-year-",  # 3 year savings plan
+    "reserved_1yr": "radio-one-year-",  # 1 year reserved
+    "reserved_3yr": "radio-three-year-",  # 3 year reserved
+}
+_VM_OS_BILLING_PREFIXES = {
+    "license_included": "radio-payg-",  # License included
+    "azure_hybrid_benefit": "radio-ahb-",  # Azure Hybrid Benefit
+}
 
 
 class AzureCalculatorClient:
@@ -41,6 +109,7 @@ class AzureCalculatorClient:
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._page: Page | None = None
 
     async def __aenter__(self) -> "AzureCalculatorClient":
         if not self.storage_state_path.exists():
@@ -100,17 +169,167 @@ class AzureCalculatorClient:
             await page.close()
 
     async def create_estimate(self) -> None:
-        raise NotImplementedError(
-            "Fase 2: criar uma nova estimativa dirigindo a UI da calculadora."
-        )
+        """Abre uma aba nova na calculadora com uma estimativa vazia.
+
+        Precisa ser chamado antes de add_line_item()/export_estimate() — eles
+        reutilizam a página aberta aqui (guardada em self._page).
+        """
+        if self._context is None:
+            raise RuntimeError(
+                "Cliente não inicializado. Use como context manager async "
+                "(async with AzureCalculatorClient() as client: ...)."
+            )
+
+        self._page = await self._context.new_page()
+        await self._page.goto(CALCULATOR_URL, wait_until="networkidle")
+
+        # Banner de cookies (opcional — só aparece na primeira visita da
+        # sessão de navegador). Rejeita não-essenciais por padrão.
+        try:
+            await self._page.get_by_role("button", name="Reject").click(timeout=3000)
+        except PlaywrightTimeoutError:
+            pass
 
     async def add_line_item(self, service: str, config: dict[str, Any]) -> None:
-        raise NotImplementedError(
-            "Fase 2: adicionar um serviço à estimativa dirigindo a UI "
-            "(mapear seletores de busca/adição de serviço)."
-        )
+        """Adiciona um serviço à estimativa e aplica os campos de config.
+
+        `service` usa as mesmas chaves de RESOLVERS (meters.py) / _CATALOG
+        (catalog.py): "vm", "storage", "sql".
+
+        Campos aceitos em `config`:
+        - Os listados em _SIMPLE_SELECT_FIELDS (selects nativos do painel).
+        - Só para "vm": _VM_TEXT_INPUT_FIELDS ("count"/"hours", texto puro),
+          "hoursFactor" (select de unidade), "size" (combobox de instância
+          com busca — ver _apply_vm_size), "computeBillingOption" e
+          "osBillingOption" (radios — chave é uma das definidas em
+          _VM_COMPUTE_BILLING_PREFIXES/_VM_OS_BILLING_PREFIXES, ex.:
+          "reserved_1yr", "azure_hybrid_benefit").
+
+        Para storage/sql, os campos além de _SIMPLE_SELECT_FIELDS (busca de
+        instância, quantidade, radios de blob/database billing) ainda não
+        têm seletor mapeado. Um campo desconhecido levanta NotImplementedError
+        em vez de ser ignorado silenciosamente — mesma regra dos resolvers em
+        meters.py: não adivinhar.
+
+        Observação: com múltiplos itens do mesmo serviço na estimativa, os
+        seletores usam a última cópia do campo no DOM (`.last`) — ainda não
+        há como mirar um item específico por índice/id.
+        """
+        if self._page is None:
+            raise RuntimeError("Chame create_estimate() antes de add_line_item().")
+
+        testid = _PICKER_TESTIDS.get(service)
+        if testid is None:
+            raise ValueError(
+                f"Serviço '{service}' sem seletor mapeado "
+                f"(esperado um de {sorted(_PICKER_TESTIDS)})."
+            )
+
+        select_fields = _SIMPLE_SELECT_FIELDS.get(service, set())
+        extra_fields: set[str] = set()
+        if service == "vm":
+            extra_fields = _VM_TEXT_INPUT_FIELDS | {
+                "hoursFactor",
+                _VM_SIZE_FIELD,
+                "computeBillingOption",
+                "osBillingOption",
+            }
+
+        unknown_fields = set(config) - select_fields - extra_fields
+        if unknown_fields:
+            raise NotImplementedError(
+                f"Campo(s) {sorted(unknown_fields)} de '{service}' ainda não "
+                "têm seletor mapeado (instância/quantidade/billing de "
+                "storage e sql, por exemplo, são follow-up)."
+            )
+
+        # O testid aparece 2x no DOM (aba "Popular" + aba da categoria); só a
+        # cópia visível é clicável.
+        add_button = self._page.locator(f'[data-testid="{testid}"]:visible').first
+        await add_button.click()
+        # Painel de config do item recém-adicionado leva um instante pra montar.
+        await self._page.wait_for_timeout(500)
+
+        for field, value in config.items():
+            if field in select_fields:
+                select = self._page.locator(f'select[name="{field}"]').last
+                await select.select_option(label=value)
+            elif field in _VM_TEXT_INPUT_FIELDS:
+                await self._page.locator(f'input[name="{field}"]').last.fill(str(value))
+            elif field == "hoursFactor":
+                await self._page.locator('select[name="hoursFactor"]').last.select_option(
+                    label=value
+                )
+            elif field == _VM_SIZE_FIELD:
+                await self._apply_vm_size(value)
+            elif field == "computeBillingOption":
+                await self._click_billing_radio(_VM_COMPUTE_BILLING_PREFIXES, value, "computeBillingOption")
+            elif field == "osBillingOption":
+                await self._click_billing_radio(_VM_OS_BILLING_PREFIXES, value, "osBillingOption")
+
+    async def _apply_vm_size(self, search_text: str) -> None:
+        """Digita no combobox INSTANCE (#size) e clica a primeira sugestão.
+
+        Widget é um react-select: digitar dispara uma busca assíncrona que
+        renderiza <div role="option"> com o SKU completo (ex. "D4s v3: 4
+        vCPUs, ..."). `search_text` deve ser específico o bastante pra
+        deixar uma opção só (ex. o skuName, não só a série), senão o
+        `.first` pode acabar escolhendo o SKU errado.
+        """
+        assert self._page is not None
+        size_input = self._page.locator("#size").last
+        await size_input.click()
+        await size_input.fill(search_text)
+        option = self._page.locator('[role="option"]:visible').first
+        await option.wait_for(state="visible", timeout=10000)
+        await option.click()
+
+    async def _click_billing_radio(
+        self, prefixes: dict[str, str], key: str, group_suffix: str
+    ) -> None:
+        """Clica o radio de billing correspondente a `key`.
+
+        Algumas opções (ex.: "1 year reserved") ficam desabilitadas pela
+        própria calculadora dependendo do SKU/região escolhido ("1 year
+        reserved option is not available for your instance selection" — visto
+        ao vivo com D4s v3). Checa is_enabled() antes de clicar pra falhar
+        rápido e com uma mensagem clara, em vez de esperar o timeout padrão
+        do Playwright tentando clicar num elemento desabilitado.
+        """
+        assert self._page is not None
+        prefix = prefixes.get(key)
+        if prefix is None:
+            raise ValueError(
+                f"Opção de billing '{key}' desconhecida (esperado um de {sorted(prefixes)})."
+            )
+        radio = self._page.locator(f'input[id^="{prefix}"][id$="-{group_suffix}"]').last
+        if not await radio.is_enabled():
+            raise ValueError(
+                f"Opção de billing '{key}' está desabilitada para o SKU/região "
+                "escolhidos (a própria calculadora restringe algumas combinações)."
+            )
+        await radio.click()
 
     async def export_estimate(self) -> str:
-        raise NotImplementedError(
-            "Fase 2: clicar em compartilhar e capturar o link da estimativa."
-        )
+        """Clica em Compartilhar e devolve o link gerado pela calculadora.
+
+        Fluxo real (menu "..." > Share): abre um dialog (`.share-modal`) com
+        o link num `<textarea readonly name="link">` — não é um `<input>` nem
+        um `<a href>`, então o valor sai por `input_value()`. Requer sessão
+        autenticada (Save/Share ficam desabilitados, com "Log in to Share",
+        quando deslogado — is_authenticated() já cobre essa checagem).
+        """
+        if self._page is None:
+            raise RuntimeError("Chame create_estimate() antes de export_estimate().")
+
+        page = self._page
+        await page.locator('[data-testid="stickyCostHeader__moreMenuButton"]').click()
+        await page.locator('[data-testid="moreOptionsMenuList__share"]').click()
+
+        dialog = page.locator(".share-modal[role=\"dialog\"]")
+        link_field = dialog.locator('textarea[name="link"]')
+        await link_field.wait_for(state="visible", timeout=10000)
+        link = await link_field.input_value()
+
+        await dialog.get_by_role("button", name="Done").click()
+        return link
