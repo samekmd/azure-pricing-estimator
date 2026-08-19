@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "azure-pricing-estimator": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "azure_estimator_mcp.server"
+      ],
+      "env": {}
+    }
+  }
+}
