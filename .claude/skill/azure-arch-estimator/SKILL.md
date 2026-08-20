@@ -55,6 +55,12 @@ template rígido.
 
 Se nenhum padrão casar, vá para o passo 2 (fallback).
 
+Antes de prosseguir para os próximos passos, declare explicitamente ao
+usuário o resultado deste passo: qual padrão foi casado (se houver), ou
+que nenhum padrão casou e por isso o fluxo seguiu para o passo 2
+(fallback). Essa declaração deve aparecer na resposta final ao usuário,
+não apenas no raciocínio interno.
+
 ### 2. Fallback — extrair componentes sem padrão
 
 Quando não houver casamento por keyword, não adivinhe: use as tools de
@@ -113,11 +119,33 @@ montar a config.
 3. **Montar a config final.** Parta do `example_config` e sobrescreva só
    o que o usuário efetivamente pediu (região, tamanho de VM, tier
    etc.). Para os campos obrigatórios que ele não mencionou, use o
-   `default` do próprio `FieldSchema` quando existir; se não houver
-   default e o campo for obrigatório, escolha um valor dentro dos
-   `values` retornados (nunca fora da amostra/API) e deixe isso
-   explícito ao usuário como premissa assumida — igual ao campo `notes`
-   dos padrões.
+   `default` do próprio `FieldSchema` quando existir.
+
+   Se não houver default e o campo for obrigatório, verifique primeiro
+   se o valor desejado aparece na amostra de `values`. Se aparecer, use
+   normalmente.
+
+   Se `values_truncated` for `true` e o valor desejado não estiver na
+   amostra (comum em campos com `value_count` alto, como `armSkuName`,
+   que tem 1792 valores possíveis contra uma amostra de menos de 25),
+   não descarte a escolha só por isso. Existem duas formas de confirmar
+   o valor antes de apresentá-lo como definitivo:
+
+   - Tentar resolver o preço diretamente (`resolve_price` ou
+     `estimate_monthly_cost`) com o valor escolhido. Se resolver sem
+     `PriceResolutionError`, isso já confirma que o valor existe como
+     meter real — informe ao usuário que a confirmação veio dessa forma.
+     Se levantar `PriceResolutionError`, trate como no caso de "Erros
+     esperados": não insista no mesmo valor, revise a escolha ou informe
+     o usuário que aquele valor específico não pôde ser confirmado.
+   - Alternativamente, montar uma consulta adicional via `values_source`
+     antes de tentar o preço, útil quando o campo não afeta diretamente
+     a resolução de preço (então uma falha na tentativa direta não
+     serviria como sinal confiável).
+
+   Em qualquer um dos casos, deixe a escolha explícita ao usuário como
+   premissa assumida, e diga como ela foi confirmada — igual ao campo
+   `notes` dos padrões.
 
 > A tabela em "Serviços suportados hoje" abaixo continua útil como
 > referência rápida offline, mas em runtime a fonte de verdade passa a
@@ -150,7 +178,10 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
 - Monte uma tabela: componente, papel, serviço, quantidade, custo
   unitário/mês, custo total/mês, e o total geral.
 - Deixe explícitas as premissas assumidas (região, tamanho de VM, volume de
-  storage etc.), do mesmo jeito que o campo `notes` faz nos padrões.
+  storage etc.), do mesmo jeito que o campo `notes` faz nos padrões. Liste
+  essas premissas numa seção própria da resposta, por exemplo "Premissas
+  assumidas:", com uma linha por componente, em vez de mencioná-las apenas
+  como perguntas abertas ao final.
 - Informe que o resultado é uma **estimativa local**, não ainda um link da
   calculadora Azure — a lógica de `create_estimate`/`add_line_item`/
   `export_estimate` já existe em `calculator_client.py`, mas os tools do
