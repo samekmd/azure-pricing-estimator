@@ -124,7 +124,7 @@ uv run python mcp-server/scripts/bootstrap_login.py
 
 ---
 
-## Cronograma (29/07 – 14/08)
+## Cronograma (29/07 – 28/08)
 
 Três blocos de trabalho. As tarefas de cada fase foram distribuídas para rodarem **em paralelo**: enquanto Samuel fecha o núcleo de preço, André adianta o esqueleto do MCP (com tools *stub*, não depende do preço pronto) e Natália constrói a biblioteca de padrões e a Skill (conhecimento, independente do código).
 
@@ -144,7 +144,7 @@ Três blocos de trabalho. As tarefas de cada fase foram distribuídas para rodar
 | **André** | Implementar `export_estimate` dirigindo a UI da calculadora via Playwright: mapear seletores (buscar serviço, configurar, compartilhar), capturar o link |
 | **Natália** | Testar a fatia vertical no Claude Code (pedido cru → link + custo) e registrar bugs e lacunas de configuração |
 
-### Fase 3 — Skill + interpretação · 10/08 – 12/08
+### Fase 3 — Skill + interpretação · 10/08 – 21/08
 
 | Membro | Tarefa |
 |--------|--------|
@@ -152,7 +152,7 @@ Três blocos de trabalho. As tarefas de cada fase foram distribuídas para rodar
 | **Samuel** | Afinar os resolvers para garantir que todos os serviços dos 3 padrões resolvem preço corretamente |
 | **André** | Robustez do export: retry, fallback e detecção de sessão expirada (orienta a refazer o bootstrap) |
 
-### Fase 4 — Integração e entrega · 13/08 – 14/08
+### Fase 4 — Integração e entrega · 24/08 – 28/08
 
 | Membro | Tarefa |
 |--------|--------|
