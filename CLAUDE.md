@@ -52,7 +52,19 @@ Two independent, deliberately decoupled subsystems live under
      a page shorter than `PAGE_SIZE=1000`; `NextPageLink` is never used as
      flow control (it comes back empty intermittently, and mixing the two
      modes desynchronized the counter and re-fetched pages). `top=N` caps a
-     query for cheap discovery probes.
+     query for cheap discovery probes. `normalize_region()` slugifies
+     commercial regions (`"East US"` → `"eastus"`), but the API's `$filter` is
+     **case-sensitive** and non-commercial pseudo-regions come back with
+     significant capitalization and spaces (`"Global"`, `"US Gov"`,
+     `"Zone 1"`, `"Intercontinental"`, continent names). Slugifying those
+     matched zero items and returned an empty list with no error, silently
+     hiding every service without commercial-region meters (Load Balancer,
+     bandwidth/egress, DNS, CDN…). `_SPECIAL_REGIONS` is an allowlist of those
+     canonical spellings — every entry confirmed by probing the live API —
+     consulted **before** the lower+replace slugify. Add a new pseudo-region
+     there only after probing that the exact spelling returns items; do not
+     work around it with client-side filtering. Note real Gov/DoD regions are
+     ordinary slugs (`usgovvirginia`, `usdodeast`) and are not exceptions.
    - `meters.py`: one resolver per service (`resolve_vm`, `resolve_storage`,
      `resolve_sql`, registered in `RESOLVERS`). Each resolver returns
      `(odata_filters, select_fn)`: filters narrow the API query server-side,
@@ -65,7 +77,13 @@ Two independent, deliberately decoupled subsystems live under
      and returns a typed `PriceResult` (see `models.py`). `monthly_cost()`
      projects unit price to a monthly cost based on `unit_of_measure` — add
      new unit mappings here rather than guessing at unrecognized units
-     (unrecognized units raise `ValueError` by design).
+     (unrecognized units raise `ValueError` by design). Units are matched
+     lowercased and stripped, after splitting off the numeric prefix, so
+     spelling variants (`"1/Day"`, `"1 /Day"`, `"1 Day"`) hit the same branch —
+     keep new mappings in that normalized form. Daily units project with
+     `DAYS_PER_MONTH = 30`, a deliberate convention (not 365/12): ×30 is what
+     matches Azure's own calculator (verified: ACR Premium $1.6666/day →
+     $50/month).
    - `catalog.py`: discovery layer behind the `search_azure_services` and
      `get_service_config_schema` tools. `_CATALOG` maps each `RESOLVERS` key to
      the exact API `serviceName`, pt-BR/en aliases and a cheap probe filter;

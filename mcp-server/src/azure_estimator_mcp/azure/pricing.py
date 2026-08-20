@@ -14,6 +14,12 @@ from .meters import RESOLVERS, PriceResolutionError
 from .retail_client import RetailPricesClient, normalize_region
 
 DEFAULT_MONTHLY_HOURS = 730  # padrão da própria calculadora Azure
+# Convenção adotada para unidades diárias ("1/Day"): 30 dias por mês, fixo.
+# Não é 365/12 (30.4375) por decisão deliberada — 30 foi o fator que casou com a
+# calculadora oficial da Azure (validado no ACR Premium: preço diário x30 bate
+# com os ~US$ 50/mês anunciados lá). Manter 30 mantém a estimativa alinhada ao
+# número que o usuário vê na calculadora.
+DAYS_PER_MONTH = 30
 
 
 async def resolve_price(
@@ -68,6 +74,8 @@ def monthly_cost(price: PriceResult, usage: dict) -> float:
       "1 GB"       -> usage['gb']
       "1/Month"    -> 1 (custo fixo mensal)
       "1 Month"    -> 1
+      "1/Day"      -> DAYS_PER_MONTH (custo diário projetado ao mês)
+      "1 Day"      -> idem
     Unidade não reconhecida levanta ValueError em vez de chutar.
     """
     uom = price.unit_of_measure.strip()
@@ -91,6 +99,10 @@ def monthly_cost(price: PriceResult, usage: dict) -> float:
             )
     elif unit in ("/month", "month"):
         quantity = 1
+    elif unit in ("/day", "day"):
+        # A unidade já chega normalizada (minúscula, sem espaços nas bordas),
+        # então "1/Day", "1 /Day" e "1 Day" caem todas aqui.
+        quantity = usage.get("days", DAYS_PER_MONTH)
     else:
         raise ValueError(
             f"unit_of_measure não reconhecido: {price.unit_of_measure!r}. "
