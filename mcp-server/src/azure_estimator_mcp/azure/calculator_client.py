@@ -50,6 +50,8 @@ _SIMPLE_SELECT_FIELDS: dict[str, set[str]] = {
         "fileStructure",
         "accessTier",
         "redundancy",
+        "storageUnits",  # unidade da capacidade: GB/TB
+        "blobDataRetrievalUnits",
     },
     "sql": {
         "region",
@@ -66,6 +68,30 @@ _SIMPLE_SELECT_FIELDS: dict[str, set[str]] = {
 # Campos de texto simples (<input>, sem widget de busca) do painel de VM.
 # "count"/"hours" têm name= e id= iguais; select_option cobre a unidade.
 _VM_TEXT_INPUT_FIELDS = {"count", "hours"}
+
+# Idem para storage. ATENÇÃO ao "count": o name é o MESMO da VM, mas o
+# significado é outro — na VM é número de instâncias, aqui é a CAPACIDADE
+# (em GB ou TB, conforme o <select storageUnits>). Como os campos são
+# resolvidos dentro do painel do item (`.last`), não há ambiguidade de
+# seletor; a ambiguidade é de leitura, daí este aviso.
+_STORAGE_TEXT_INPUT_FIELDS = {
+    "count",  # capacidade
+    "blobWriteOperations",
+    "blobCreateContainerOperations",
+    "blobReadOperations",
+    "blobOtherOperations",
+    "blobDataRetrieval",
+}
+_TEXT_INPUT_FIELDS = _VM_TEXT_INPUT_FIELDS | _STORAGE_TEXT_INPUT_FIELDS
+
+# Billing do storage. Diferente do SQL, o default aqui JÁ é "Pay as you go"
+# (confirmado ao vivo em 20/08) — mas o campo é emitido explicitamente do
+# mesmo jeito, pela mesma razão: default não é escolha.
+_STORAGE_BILLING_PREFIXES = {
+    "payg": "radio-payg-",
+    "reserved_1yr": "radio-one-year-",
+    "reserved_3yr": "radio-three-year-",
+}
 
 # O campo INSTANCE (#size) é um combobox com busca (react-select) — digitar
 # filtra e abre um <div role="option"> com o texto completo do SKU (ex.:
@@ -88,6 +114,26 @@ _VM_COMPUTE_BILLING_PREFIXES = {
 _VM_OS_BILLING_PREFIXES = {
     "license_included": "radio-payg-",  # License included
     "azure_hybrid_benefit": "radio-ahb-",  # Azure Hybrid Benefit
+}
+
+# SQL Database tem DOIS grupos de radio, e os dois vêm com um default que NÃO
+# é pay-as-you-go — medido ao vivo em 20/08:
+#   databaseBillingOption -> "3 year reserved (~55% discount)"
+#   softwareBillingOption -> "Bring Your Own License (Azure Hybrid Benefit)"
+# Ou seja: um item de SQL adicionado sem tocar nesses radios é precificado como
+# reserva de 3 anos SEM licença — ~53% abaixo do preço on-demand que a Retail
+# Prices API devolve. Não dá para deixar no default; ver config_translate.py.
+_SQL_DATABASE_BILLING_PREFIXES = {
+    "payg": "radio-payg-",
+    "savings_1yr": "radio-sv-one-year-",
+    "savings_3yr": "radio-sv-three-year-",
+    "reserved_1yr": "radio-one-year-",
+    "reserved_3yr": "radio-three-year-",
+}
+_SQL_SOFTWARE_BILLING_PREFIXES = {
+    "license_included": "radio-payg-",  # "Pay as you go" = licença inclusa
+    "savings_1yr": "radio-sv-one-year-",
+    "azure_hybrid_benefit": "radio-ahb-",  # BYOL
 }
 
 
@@ -205,9 +251,16 @@ class AzureCalculatorClient:
           _VM_COMPUTE_BILLING_PREFIXES/_VM_OS_BILLING_PREFIXES, ex.:
           "reserved_1yr", "azure_hybrid_benefit").
 
-        Para storage/sql, os campos além de _SIMPLE_SELECT_FIELDS (busca de
-        instância, quantidade, radios de blob/database billing) ainda não
-        têm seletor mapeado. Um campo desconhecido levanta NotImplementedError
+        - Só para "sql": "databaseBillingOption" (payg/savings/reserved) e
+          "softwareBillingOption" (license_included/azure_hybrid_benefit).
+          NÃO omita os dois: os defaults da calculadora são "3 year reserved"
+          e "Azure Hybrid Benefit", que precificam ~53% abaixo do on-demand.
+
+        - Só para "storage": _STORAGE_TEXT_INPUT_FIELDS (capacidade em
+          "count" + unidade em "storageUnits", e os contadores de operações)
+          e "blobBillingOption".
+
+        Para storage, a QUANTIDADE de contas ainda não Um campo desconhecido levanta NotImplementedError
         em vez de ser ignorado silenciosamente — mesma regra dos resolvers em
         meters.py: não adivinhar.
 
@@ -234,6 +287,10 @@ class AzureCalculatorClient:
                 "computeBillingOption",
                 "osBillingOption",
             }
+        elif service == "sql":
+            extra_fields = {"databaseBillingOption", "softwareBillingOption"}
+        elif service == "storage":
+            extra_fields = _STORAGE_TEXT_INPUT_FIELDS | {"blobBillingOption"}
 
         unknown_fields = set(config) - select_fields - extra_fields
         if unknown_fields:
@@ -246,15 +303,30 @@ class AzureCalculatorClient:
         # O testid aparece 2x no DOM (aba "Popular" + aba da categoria); só a
         # cópia visível é clicável.
         add_button = self._page.locator(f'[data-testid="{testid}"]:visible').first
+
+        # O painel do item novo é montado de forma ASSÍNCRONA, e demora mais
+        # conforme a estimativa cresce (medido ao vivo: ~1.1s com 3 itens já
+        # na lista). Antes aqui havia uma espera fixa de 500ms — uma corrida:
+        # se o painel ainda não existisse, o `.last` dos campos abaixo
+        # resolvia para o item ANTERIOR e o select_option morria num timeout
+        # de 30s procurando um rótulo que não existe naquele serviço (ex.:
+        # "Block Blob Storage" no <select type> de um item SQL). Agora
+        # esperamos o painel APARECER, não o relógio: contamos as âncoras
+        # antes do clique e aguardamos a de índice `antes` existir. Todos os
+        # três serviços têm um <select name="region"> no painel, então ela
+        # serve de âncora comum.
+        ancora = 'select[name="region"]'
+        antes = await self._page.locator(ancora).count()
         await add_button.click()
-        # Painel de config do item recém-adicionado leva um instante pra montar.
-        await self._page.wait_for_timeout(500)
+        await self._page.locator(ancora).nth(antes).wait_for(
+            state="attached", timeout=15000
+        )
 
         for field, value in config.items():
             if field in select_fields:
                 select = self._page.locator(f'select[name="{field}"]').last
                 await select.select_option(label=value)
-            elif field in _VM_TEXT_INPUT_FIELDS:
+            elif field in _TEXT_INPUT_FIELDS:
                 await self._page.locator(f'input[name="{field}"]').last.fill(str(value))
             elif field == "hoursFactor":
                 await self._page.locator('select[name="hoursFactor"]').last.select_option(
@@ -266,6 +338,18 @@ class AzureCalculatorClient:
                 await self._click_billing_radio(_VM_COMPUTE_BILLING_PREFIXES, value, "computeBillingOption")
             elif field == "osBillingOption":
                 await self._click_billing_radio(_VM_OS_BILLING_PREFIXES, value, "osBillingOption")
+            elif field == "databaseBillingOption":
+                await self._click_billing_radio(
+                    _SQL_DATABASE_BILLING_PREFIXES, value, "databaseBillingOption"
+                )
+            elif field == "softwareBillingOption":
+                await self._click_billing_radio(
+                    _SQL_SOFTWARE_BILLING_PREFIXES, value, "softwareBillingOption"
+                )
+            elif field == "blobBillingOption":
+                await self._click_billing_radio(
+                    _STORAGE_BILLING_PREFIXES, value, "blobBillingOption"
+                )
 
     async def _apply_vm_size(self, search_text: str) -> None:
         """Digita no combobox INSTANCE (#size) e clica a primeira sugestão.

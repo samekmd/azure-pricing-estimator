@@ -92,7 +92,7 @@ Two independent, deliberately decoupled subsystems live under
      what the resolvers consume; it must not resolve prices or pick meters.
      When adding a resolver to `meters.py`, add its entry + field builder here.
 
-2. **Calculator automation (`calculator_client.py`,
+2. **Calculator automation (`calculator_client.py`, `config_translate.py`,
    `scripts/bootstrap_login.py`)** — Playwright-driven browser automation
    against the authenticated Azure Pricing Calculator UI. This exists because
    the calculator's save endpoint requires a real authenticated browser
@@ -107,9 +107,46 @@ Two independent, deliberately decoupled subsystems live under
      MCP tools) that loads the saved `storage_state` to drive the UI already
      authenticated. There is no auto-refresh of the session by design — if
      `is_authenticated()` returns `False`, rerun `bootstrap_login.py`.
-     `create_estimate`, `add_line_item`, `export_estimate` are still stubs
-     (Phase 2 — UI selectors for building/sharing an estimate aren't mapped
-     yet); they raise `NotImplementedError`.
+     `create_estimate`, `add_line_item` and `export_estimate` are
+     implemented, and the four MCP tools in `server.py` are wired to them.
+     The full pattern→link cycle was verified end-to-end on 2026-08-20.
+     The browser session is a **module-level singleton** in `server.py`, not
+     one client per tool call: `add_line_item`/`export_estimate` drive the
+     page `create_estimate` stored in `self._page`, so an `async with` per
+     tool would lose the estimate between calls. An `asyncio.Lock`
+     serializes access — there is a single shared page.
+     `add_line_item` takes config in the **calculator UI's** vocabulary, so
+     `config_translate.py` (below) is what MCP callers go through; an
+     unmapped field raises `NotImplementedError` instead of being silently
+     dropped (same no-guessing rule as `meters.py`). All three services are
+     mapped, including their billing radio groups; what is still missing is
+     the storage **account quantity** (the storage panel's `count` is
+     capacity, not quantity) and any way to target one item — with several
+     items of one service the selectors hit `.last`, so items can be added
+     but not edited afterwards. Note `export_estimate` does not self-check
+     the session (the Share menu item stays `enabled` when logged out — its
+     "Log in to Share" is a label, not a `disabled` — so it would die on a
+     10s Playwright timeout); the MCP tool calls `is_authenticated()` first
+     to turn that into a clear error.
+   - `config_translate.py`: the bridge between the two vocabularies —
+     `armSkuName: Standard_D2s_v3` → `size: "D2s v3"`, `windows: false` →
+     `operatingSystem: "Linux"`, `hardware: Gen5` → `generation:
+     "Standard-series (Gen 5)"`. Pure dict→dict: it imports neither
+     Playwright nor httpx, so it does not break the decoupling below and is
+     testable offline. Two rules matter when editing it. **First**, every UI
+     label is matched by exact text (`select_option(label=...)`), so labels
+     must come from probing the live DOM, never from guessing — a wrong
+     label fails as a Playwright timeout, not a clear error. **Second**,
+     always emit what the config determines; never rely on a UI default.
+     Four calculator defaults contradict what the resolvers assume:
+     `operatingSystem`=Windows (resolver assumes Linux), `vcoreTier`=
+     Hyperscale (resolver assumes General Purpose), and for SQL
+     `databaseBillingOption`=3-year-reserved plus `softwareBillingOption`=
+     Azure Hybrid Benefit — the last two alone price ~53% under on-demand
+     with nothing on screen saying so. Whatever the config determines is
+     emitted explicitly even when it matches the default; what it does not
+     determine is returned in `assumptions`/`unsupported` for the caller to
+     show the user, never dropped silently.
 
 These two subsystems must stay decoupled — pricing lookup must never import
 Playwright, and the calculator client must never call the Retail Prices API
