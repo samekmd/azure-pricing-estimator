@@ -1,12 +1,16 @@
 # Padrão de arquitetura: Microsserviços em AKS
 #
-# STATUS: PARCIALMENTE BLOQUEADO. database e shared-storage usam o
-# vocabulário real de meters.py (sql, storage) e são resolvíveis hoje. 
-# O node-pool também é resolvível hoje (nodes do AKS são VMs normais,
-# cobradas por vCore/hora como qualquer VM — reaproveita o resolver "vm").
-# O que falta é o control-plane-sla: a taxa do SLA do control plane
-# gerenciado (serviceName "Azure Kubernetes Service" na Retail Prices API)
-# não tem resolver ainda em meters.py.
+# STATUS: os 4 componentes resolvem PREÇO (21/08). database e shared-storage
+# usam o vocabulário real de meters.py (sql, storage); o node-pool reaproveita
+# o resolver "vm" (nodes do AKS são VMs normais, cobradas por vCore/hora); e o
+# control-plane-sla passou a ter resolver próprio ("aks" em meters.py), que
+# isola o meter "Standard Uptime SLA" do serviceName "Azure Kubernetes
+# Service".
+#
+# RESSALVA da fatia vertical: o "aks" ainda NÃO tem tradução para a UI da
+# calculadora (config_translate.py) — o painel do serviço não foi mapeado.
+# Então este componente entra no custo estimado, mas não pode ser adicionado
+# ao link da calculadora; add_line_item recusa com ConfigTranslationError.
 
 pattern:
   id: aks-microservices
@@ -39,7 +43,7 @@ components:
 
   - id: control-plane-sla
     role: "SLA do control plane gerenciado (camada Standard/paga)"
-    service: aks  # TODO(bloqueado): resolver "aks" não existe em meters.py ainda
+    service: aks  # resolve preço; sem tradução para a UI da calculadora ainda
     quantity: 1
     config:
       region: East US
