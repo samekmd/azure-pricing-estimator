@@ -27,6 +27,7 @@ testpaths = ["mcp-server/tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: testes que batem na API real (pulados sem rede)",
+    "browser: testes que abrem a calculadora num Chromium real (sem efeito colateral; não exigem sessão)",
 ]
 
 [build-system]

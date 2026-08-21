@@ -29,6 +29,11 @@ uv run pytest mcp-server/tests/test_meters.py::test_name -v
 uv run pytest -m integration
 make test-integration
 
+# check the calculator's DOM selectors against the live page (opens a real
+# Chromium; needs no session and publishes nothing)
+uv run pytest -m browser
+make test-browser
+
 # one-time interactive login for the Playwright-driven calculator client
 uv run python mcp-server/scripts/bootstrap_login.py
 make bootstrap-login
@@ -107,27 +112,44 @@ Two independent, deliberately decoupled subsystems live under
      MCP tools) that loads the saved `storage_state` to drive the UI already
      authenticated. There is no auto-refresh of the session by design — if
      `is_authenticated()` returns `False`, rerun `bootstrap_login.py`.
-     `create_estimate`, `add_line_item` and `export_estimate` are
-     implemented, and the four MCP tools in `server.py` are wired to them.
+     `create_estimate`, `add_line_item`, `edit_line_item` and
+     `export_estimate` are implemented, and the six MCP calculator tools in
+     `server.py` are wired to them.
      The full pattern→link cycle was verified end-to-end on 2026-08-20.
      The browser session is a **module-level singleton** in `server.py`, not
      one client per tool call: `add_line_item`/`export_estimate` drive the
      page `create_estimate` stored in `self._page`, so an `async with` per
      tool would lose the estimate between calls. An `asyncio.Lock`
-     serializes access — there is a single shared page.
+     serializes access — there is a single shared page. The singleton is
+     closed by the server's `lifespan` on shutdown, by the `close_calculator`
+     tool, and by an idle watchdog — but the watchdog only fires when **no
+     estimate is open** (`_estimate_open`, cleared after a successful
+     export), because the estimate lives only in the page and closing would
+     destroy it silently.
      `add_line_item` takes config in the **calculator UI's** vocabulary, so
      `config_translate.py` (below) is what MCP callers go through; an
      unmapped field raises `NotImplementedError` instead of being silently
      dropped (same no-guessing rule as `meters.py`). All three services are
      mapped, including their billing radio groups; what is still missing is
      the storage **account quantity** (the storage panel's `count` is
-     capacity, not quantity) and any way to target one item — with several
-     items of one service the selectors hit `.last`, so items can be added
-     but not edited afterwards. Note `export_estimate` does not self-check
-     the session (the Share menu item stays `enabled` when logged out — its
-     "Log in to Share" is a label, not a `disabled` — so it would die on a
-     10s Playwright timeout); the MCP tool calls `is_authenticated()` first
-     to turn that into a clear error.
+     capacity, not quantity).
+     Every field is resolved **inside the item's container**
+     (`div[id="<slug>-<GUID>-layout"]`, one per line item, DOM order =
+     insertion order), never by `.last` — that is what makes a specific item
+     addressable: `add_line_item` returns the container id as `item_id` and
+     `edit_line_item(item_id, config)` reapplies fields to that item alone,
+     deriving the service from the id's slug. Scoping is not cosmetic: with
+     two VMs the document holds two elements with `id="size"`. The GUID in
+     the container id is the same one embedded in the billing radio ids, so
+     scoping by container scopes the radios for free.
+     Some billing groups are **conditional**: `osBillingOption` only exists
+     when `operatingSystem=Windows`, and SQL's `softwareBillingOption` has
+     only `payg`/`ahb` (no savings plan). A missing group raises a clear
+     `ValueError` rather than a 30s Playwright timeout.
+     `export_estimate` checks the session itself before clicking Share (the
+     menu item stays `enabled` when logged out — its "Log in to Share" is a
+     label, not a `disabled`) and raises `CalculatorAuthError`; the MCP tool
+     also checks up front.
    - `config_translate.py`: the bridge between the two vocabularies —
      `armSkuName: Standard_D2s_v3` → `size: "D2s v3"`, `windows: false` →
      `operatingSystem: "Linux"`, `hardware: Gen5` → `generation:
