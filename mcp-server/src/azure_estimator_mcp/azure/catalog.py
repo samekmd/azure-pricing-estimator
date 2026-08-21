@@ -152,6 +152,28 @@ _CATALOG: dict[str, _Service] = {
             "skuName": "2 vCore",
         },
     ),
+    "aks": _Service(
+        key="aks",
+        service_name="Azure Kubernetes Service",
+        label="Kubernetes gerenciado (Azure Kubernetes Service)",
+        aliases=(
+            "aks",
+            "kubernetes",
+            "k8s",
+            "cluster",
+            "clusters",
+            "container orchestration",
+            "orquestracao de containers",
+            "microsservicos",
+            "microservicos",
+            "microservices",
+        ),
+        anchor=lambda region: {
+            "serviceName": "Azure Kubernetes Service",
+            "armRegionName": region,
+            "skuName": "Standard",
+        },
+    ),
 }
 
 # Sonda global de regiões: um único SKU de VM em TODAS as regiões devolve a lista
@@ -612,10 +634,97 @@ async def _fields_sql(*, region, currency, sample_size, client):
     return campos, exemplo, notas
 
 
+async def _fields_aks(*, region, currency, sample_size, client):
+    """Campos do control plane do AKS.
+
+    Cobre SÓ a taxa do control plane gerenciado. Os nós do cluster são VMs
+    comuns: quem os precifica é o serviço 'vm' — não há nada de AKS neles.
+    """
+    svc = _CATALOG["aks"]
+    base_probe = {
+        "serviceName": svc.service_name,
+        "armRegionName": region,
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Só os skuName que têm de fato um meter de control plane que o resolver
+    # sabe escolher ("Uptime SLA" / "Long Term Support"). Sondado em 21/08:
+    # isso deixa "Standard". Ficam de fora "Automatic" (AKS Automatic, que tem
+    # meters próprios — "Automatic Hosted Control Plane" e um por categoria de
+    # nó) e os "Anyscale …". Listá-los aqui faria o agente montar uma config
+    # que o resolver recusa; o schema promete só o que resolve.
+    _METERS_DE_CONTROL_PLANE = ("uptime sla", "long term support")
+    tiers = sorted(
+        {
+            str(it.get("skuName"))
+            for it in itens
+            if any(
+                alvo in str(it.get("meterName", "")).lower()
+                for alvo in _METERS_DE_CONTROL_PLANE
+            )
+        }
+    )
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure. Aceita 'East US' ou 'eastus' — é normalizada.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Camada do control plane. O tier gratuito do AKS não tem meter na "
+            "API (não há o que cobrar), então só as camadas listadas resolvem.",
+            default="Standard",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "skuName"),
+        ),
+        _field(
+            "longTermSupport",
+            "boolean",
+            False,
+            "Cobra o adicional de Long Term Support (suporte estendido de "
+            "versão do Kubernetes) em vez do Uptime SLA. São meters "
+            "diferentes, e o LTS é bem mais caro.",
+            default=False,
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "Standard")}
+    notas = [
+        "Precifica só o control plane. Os NÓS do cluster são VMs comuns — "
+        "resolva-os pelo serviço 'vm', com o armSkuName do node pool.",
+        "Sob o skuName 'Standard' convivem dois meters ('Uptime SLA' e 'Long "
+        "Term Support'); o resolver escolhe pelo campo longTermSupport.",
+        "AKS Automatic não é coberto: é outro produto, com meters próprios "
+        "('Automatic Hosted Control Plane' e um por categoria de nó).",
+    ]
+    return campos, exemplo, notas
+
+
 _BUILDERS: dict[str, Callable] = {
     "vm": _fields_vm,
     "storage": _fields_storage,
     "sql": _fields_sql,
+    "aks": _fields_aks,
 }
 
 

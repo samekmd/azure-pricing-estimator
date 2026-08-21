@@ -202,9 +202,56 @@ def resolve_sql(config: dict) -> Resolver:
     return filters, select
 
 
+# --------------------------------------------------------------------------- #
+# Azure Kubernetes Service — SÓ a taxa do control plane gerenciado.
+#
+# Os NÓS do cluster não entram aqui: são VMs comuns, cobradas por hora como
+# qualquer outra, e já resolvidas por resolve_vm (validado no componente
+# `node-pool` do padrão aks-microservices). Este resolver cobre exclusivamente a
+# taxa fixa do control plane.
+# --------------------------------------------------------------------------- #
+def resolve_aks(config: dict) -> Resolver:
+    region = config["region"]
+    # A camada paga do control plane. Sondado em 21/08 (eastus): o único
+    # skuName com meter de control plane é "Standard"; o tier gratuito do AKS
+    # NÃO tem meter na Retail Prices API (não há o que cobrar), então pedir
+    # tier="Free" cai em zero candidatos e levanta PriceResolutionError em vez
+    # de devolver um preço inventado.
+    tier = config.get("tier", "Standard")
+    # "Long Term Support" é um ADICIONAL (suporte estendido de versão do
+    # Kubernetes), cobrado à parte do Uptime SLA e 6x mais caro ($0.60/h contra
+    # $0.10/h em eastus). Sob o mesmo skuName "Standard" convivem os dois
+    # meters, então a escolha tem que ser explícita — sem isso o seletor teria
+    # 2 candidatos e, pela regra da casa, não adivinharia.
+    long_term_support = bool(config.get("longTermSupport", False))
+    price_type = config.get("priceType", "Consumption")
+
+    filters = {
+        "serviceName": "Azure Kubernetes Service",
+        "armRegionName": region,
+        "skuName": tier,
+        "priceType": price_type,
+    }
+
+    def select(items: list[dict]) -> dict:
+        alvo = "Long Term Support" if long_term_support else "Uptime SLA"
+        cands = [it for it in items if _contains(it, "meterName", alvo)]
+        # ATENÇÃO — NÃO chamar _primary_only aqui. Medido em 21/08 (eastus): o
+        # meter certo, "Standard Uptime SLA", vem com isPrimaryMeterRegion=False,
+        # enquanto o "Standard Long Term Support" vem com True. Filtrar região
+        # primária antes de escolher o meter descartaria exatamente o item
+        # procurado e devolveria o adicional de LTS — 6x o preço, em silêncio.
+        # É a mesma armadilha já registrada na Fase 1 para o on-demand de VM.
+        # _select_unique já deduplica linhas repetidas do mesmo meterId.
+        return _select_unique(cands, f"AKS {tier} {alvo} em {region}")
+
+    return filters, select
+
+
 # Registro serviço -> resolver, usado por pricing.resolve_price.
 RESOLVERS: dict[str, Callable[[dict], Resolver]] = {
     "vm": resolve_vm,
     "storage": resolve_storage,
     "sql": resolve_sql,
+    "aks": resolve_aks,
 }

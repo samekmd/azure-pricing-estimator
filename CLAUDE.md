@@ -71,13 +71,23 @@ Two independent, deliberately decoupled subsystems live under
      work around it with client-side filtering. Note real Gov/DoD regions are
      ordinary slugs (`usgovvirginia`, `usdodeast`) and are not exceptions.
    - `meters.py`: one resolver per service (`resolve_vm`, `resolve_storage`,
-     `resolve_sql`, registered in `RESOLVERS`). Each resolver returns
+     `resolve_sql`, `resolve_aks`, registered in `RESOLVERS`). Each resolver returns
      `(odata_filters, select_fn)`: filters narrow the API query server-side,
      `select_fn` applies additional disambiguation that can't be expressed as
      an OData filter (e.g. excluding Spot/Windows variants by substring).
      **Hard rule**: if a selector can't isolate exactly one candidate meter,
      it must raise `PriceResolutionError` with the candidates attached rather
      than guess. When adding a new service resolver, follow this pattern.
+     `resolve_aks` prices **only** the managed control plane fee — cluster
+     nodes are ordinary VMs, already covered by `resolve_vm`. It deliberately
+     does **not** call `_primary_only`: probed live, the right meter
+     (`Standard Uptime SLA`) comes back with `isPrimaryMeterRegion=False`
+     while the 6x pricier `Standard Long Term Support` add-on comes back
+     `True`, so filtering on the primary region first would silently return
+     the wrong meter — the same trap already documented for on-demand VMs.
+     Note a resolver existing does not imply the service can be added to the
+     calculator: `aks` resolves a price but has no `config_translate.py`
+     mapping yet, so `add_line_item` refuses it with a clear error.
    - `pricing.py`: `resolve_price()` wires a resolver to `RetailPricesClient`
      and returns a typed `PriceResult` (see `models.py`). `monthly_cost()`
      projects unit price to a monthly cost based on `unit_of_measure` — add

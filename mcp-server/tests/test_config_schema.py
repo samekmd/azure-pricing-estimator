@@ -156,8 +156,11 @@ async def test_aceita_key_service_name_e_alias(api_mockada):
 
 
 async def test_servico_desconhecido_levanta_value_error(api_mockada):
+    # "kubernetes" servia de exemplo aqui até 21/08, quando virou alias de
+    # 'aks'. Trocado por um serviço que segue sem resolver — o teste é sobre a
+    # forma do erro, não sobre este serviço em particular.
     with pytest.raises(ValueError, match="Serviço desconhecido"):
-        await catalog.config_schema("kubernetes", region="eastus")
+        await catalog.config_schema("cosmos db", region="eastus")
 
 
 async def test_sql_deriva_tier_compute_e_vcores_da_api(api_mockada):

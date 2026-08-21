@@ -43,7 +43,7 @@ PATTERNS_DIR = (
 )
 
 # Serviços que a Skill trata como BLOQUEADOS de propósito (Fase 4).
-BLOQUEADOS = {"aks", "synapse"}
+BLOQUEADOS = {"synapse"}
 
 
 # --------------------------------------------------------------------------- #
@@ -81,8 +81,8 @@ def test_padroes_encontrados():
     assert PATTERNS_DIR.is_dir(), f"patterns/ não encontrado em {PATTERNS_DIR}"
     assert len(list(PATTERNS_DIR.glob("*.yaml"))) == 3
     assert len(ALL_COMPONENTS) == 10, [cid for cid, _ in ALL_COMPONENTS]
-    assert len(RESOLVIVEIS) == 8
-    assert len(BLOQUEADOS_COMPS) == 2
+    assert len(RESOLVIVEIS) == 9
+    assert len(BLOQUEADOS_COMPS) == 1
 
 
 @_params(ALL_COMPONENTS)
@@ -284,6 +284,43 @@ FAKE_ITEMS: list[dict] = [
         skuName="Data Stored", armSkuName="", meterName="Data Stored",
         unitOfMeasure="1 GB/Month", retailPrice=0.115, meterId="sql-gp-storage",
     ),
+    # --- AKS: control plane. A ARMADILHA está aqui ------------------------
+    # Medido na API real (eastus, 21/08): o meter CERTO ("Standard Uptime SLA")
+    # vem com isPrimaryMeterRegion=False, e o adicional de Long Term Support —
+    # 6x mais caro — vem com True. Um resolver que filtrasse região primária
+    # antes de escolher o meter devolveria o LTS em silêncio. Os valores abaixo
+    # reproduzem isso de propósito: se alguém acrescentar _primary_only ao
+    # resolve_aks, este pool faz o teste falhar.
+    _item(
+        serviceName="Azure Kubernetes Service",
+        productName="Azure Kubernetes Service", skuName="Standard",
+        armSkuName="", meterName="Standard Uptime SLA", unitOfMeasure="1 Hour",
+        retailPrice=0.1, meterId="aks-standard-uptime-sla",
+        isPrimaryMeterRegion=False,
+    ),
+    _item(
+        serviceName="Azure Kubernetes Service",
+        productName="Azure Kubernetes Service", skuName="Standard",
+        armSkuName="", meterName="Standard Long Term Support",
+        unitOfMeasure="1 Hour", retailPrice=0.6, meterId="aks-standard-lts",
+        isPrimaryMeterRegion=True,
+    ),
+    # AKS Automatic: outro produto, mesmo serviceName. O filtro de skuName o
+    # descarta server-side; está aqui para provar que descarta.
+    *[
+        _item(
+            serviceName="Azure Kubernetes Service",
+            productName="Azure Kubernetes Service - Automatic",
+            skuName="Automatic", armSkuName="", meterName=nome,
+            unitOfMeasure="1 Hour", retailPrice=preco,
+            meterId=f"aks-automatic-{nome.lower().replace(' ', '-')}",
+        )
+        for nome, preco in (
+            ("Automatic Hosted Control Plane", 0.16),
+            ("Automatic General Purpose", 0.007841),
+            ("Automatic Compute Optimized", 0.012196),
+        )
+    ],
     # --- Ruído de outra região: descartado pelo filtro de região ----------
     *[
         {**it, "armRegionName": "westeurope", "meterId": f"{it['meterId']}-weu"}
@@ -327,6 +364,7 @@ METER_ESPERADO = {
     "aks-microservices::node-pool": "Standard_D4s_v3-linux",
     "aks-microservices::database": "sql-gp-gen5-2vcore",
     "aks-microservices::shared-storage": "blob-hot-lrs",
+    "aks-microservices::control-plane-sla": "aks-standard-uptime-sla",
     "data-lakehouse::data-lake-storage": "blob-hot-lrs",
 }
 
@@ -410,7 +448,7 @@ async def test_erro_de_bloqueio_se_distingue_de_erro_de_ambiguidade():
     respx.get(BASE_URL).mock(side_effect=_fake_api)
 
     with pytest.raises(PriceResolutionError) as bloqueado:
-        await resolve_price("aks", {"region": "East US", "tier": "Standard"})
+        await resolve_price("synapse", {"region": "East US"})
 
     # Mesmo serviço válido (sql), mas sem vCores: sobra mais de um meter.
     async with RetailPricesClient() as client:

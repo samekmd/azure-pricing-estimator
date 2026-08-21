@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from azure_estimator_mcp.azure.config_translate import (
+    _TRANSLATORS,
     ConfigTranslationError,
     translate_config,
 )
@@ -23,6 +24,16 @@ from .test_patterns_resolve import ALL_COMPONENTS, BLOQUEADOS, PATTERNS_DIR  # n
 # Componentes resolvíveis dos padrões — definido cedo porque vários testes
 # abaixo parametrizam em cima dele.
 RESOLVIVEIS = [(cid, c) for cid, c in ALL_COMPONENTS if c["service"] not in BLOQUEADOS]
+
+# As duas metades do projeto não avançam no mesmo passo, e este arquivo é sobre
+# a metade da CALCULADORA. Um serviço pode já resolver PREÇO (meters.py) e
+# ainda não ter tradução para a UI — é o caso do 'aks' desde 21/08, cujo
+# resolver entrou pela trilha de preço enquanto o painel da calculadora ainda
+# não foi mapeado. Derivar a lista de _TRANSLATORS (em vez de repetir nomes à
+# mão) mantém a distinção honesta sozinha: quando a tradução do aks entrar, ele
+# migra para TRADUZIVEIS e passa a ser exercitado por todos os testes abaixo.
+TRADUZIVEIS = [(cid, c) for cid, c in RESOLVIVEIS if c["service"] in _TRANSLATORS]
+SEM_TRADUCAO = [(cid, c) for cid, c in RESOLVIVEIS if c["service"] not in _TRANSLATORS]
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +225,7 @@ def test_storage_declara_operacoes_no_default():
 
 @pytest.mark.parametrize(
     ("caso_id", "comp"),
-    [pytest.param(cid, c, id=cid) for cid, c in RESOLVIVEIS if c["service"] == "storage"],
+    [pytest.param(cid, c, id=cid) for cid, c in TRADUZIVEIS if c["service"] == "storage"],
 )
 def test_storage_do_padrao_leva_o_volume(caso_id, comp):
     """Os 3 storages dos padrões (200/500/1000 GB) chegam à UI com o volume certo."""
@@ -235,7 +246,7 @@ def test_vm_declara_premissas():
 
 
 @pytest.mark.parametrize(
-    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in RESOLVIVEIS]
+    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in TRADUZIVEIS]
 )
 def test_componente_do_padrao_traduz(caso_id, comp):
     t = translate_config(
@@ -249,12 +260,30 @@ def test_componente_do_padrao_traduz(caso_id, comp):
 
 @pytest.mark.parametrize(
     ("caso_id", "comp"),
-    [pytest.param(cid, c, id=cid) for cid, c in RESOLVIVEIS if c["service"] == "vm"],
+    [pytest.param(cid, c, id=cid) for cid, c in TRADUZIVEIS if c["service"] == "vm"],
 )
 def test_vm_do_padrao_vai_como_linux(caso_id, comp):
     """Todos os componentes de VM dos padrões são Linux — nenhum pode virar Windows."""
     t = translate_config("vm", comp["config"], comp.get("usage") or {})
     assert t.ui_config["operatingSystem"] == "Linux"
+
+
+@pytest.mark.parametrize(
+    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in SEM_TRADUCAO]
+)
+def test_componente_que_resolve_preco_mas_nao_traduz_falha_claro(caso_id, comp):
+    """Documenta um buraco REAL da fatia vertical, em vez de escondê-lo.
+
+    Estes componentes têm preço (resolve_price funciona) mas não podem ser
+    adicionados à calculadora: o painel do serviço ainda não foi mapeado. O
+    erro é limpo — ConfigTranslationError, não um timeout do Playwright — e a
+    Skill consegue dizer ao usuário "sei o custo, não sei montar o item".
+
+    Quando a tradução entrar, a lista SEM_TRADUCAO esvazia e este teste some
+    junto (parametrização vazia), sem ninguém precisar lembrar de removê-lo.
+    """
+    with pytest.raises(ConfigTranslationError, match="não tem tradução"):
+        translate_config(comp["service"], comp["config"], comp.get("usage") or {})
 
 
 def test_componentes_bloqueados_nao_traduzem():
@@ -290,7 +319,7 @@ def test_sql_price_type_nao_consumption_para():
 
 @pytest.mark.parametrize(
     ("caso_id", "comp"),
-    [pytest.param(cid, c, id=cid) for cid, c in RESOLVIVEIS if c["service"] == "sql"],
+    [pytest.param(cid, c, id=cid) for cid, c in TRADUZIVEIS if c["service"] == "sql"],
 )
 def test_sql_do_padrao_vai_on_demand_com_licenca(caso_id, comp):
     t = translate_config("sql", comp["config"], comp.get("usage") or {})
