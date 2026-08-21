@@ -42,8 +42,19 @@ PATTERNS_DIR = (
     / "patterns"
 )
 
-# Serviços que a Skill trata como BLOQUEADOS de propósito (Fase 4).
-BLOQUEADOS = {"synapse"}
+# Serviços de algum padrão que ainda NÃO têm resolver. Vazio desde 21/08, com
+# a entrada de `aks` e `synapse`: os 10 componentes dos 3 padrões resolvem.
+# A maquinaria fica de pé de propósito — quando um padrão novo trouxer um
+# serviço sem resolver, test_componente_tem_forma_esperada o obriga a passar
+# por aqui em vez de falhar de um jeito qualquer.
+BLOQUEADOS: set[str] = set()
+
+# Serviços que NÃO são dos padrões e seguem sem resolver — o contrato de erro
+# que a Skill usa para dizer "não estimável" continua valendo, e precisa de
+# alguém para exercitá-lo agora que BLOQUEADOS esvaziou. Databricks está fora
+# de escopo por decisão de produto (ver README); Cosmos DB simplesmente não
+# foi implementado.
+FORA_DE_ESCOPO = ["databricks", "cosmos db"]
 
 
 # --------------------------------------------------------------------------- #
@@ -81,8 +92,8 @@ def test_padroes_encontrados():
     assert PATTERNS_DIR.is_dir(), f"patterns/ não encontrado em {PATTERNS_DIR}"
     assert len(list(PATTERNS_DIR.glob("*.yaml"))) == 3
     assert len(ALL_COMPONENTS) == 10, [cid for cid, _ in ALL_COMPONENTS]
-    assert len(RESOLVIVEIS) == 9
-    assert len(BLOQUEADOS_COMPS) == 1
+    assert len(RESOLVIVEIS) == 10
+    assert len(BLOQUEADOS_COMPS) == 0
 
 
 @_params(ALL_COMPONENTS)
@@ -321,6 +332,47 @@ FAKE_ITEMS: list[dict] = [
             ("Automatic Compute Optimized", 0.012196),
         )
     ],
+    # --- Synapse: serverless SQL pool, cobrado por TB PROCESSADO ----------
+    _item(
+        serviceName="Azure Synapse Analytics",
+        productName="Azure Synapse Analytics Serverless SQL Pool",
+        skuName="Standard", armSkuName="", meterName="Standard Data Processed",
+        unitOfMeasure="1 TB", retailPrice=5.0,
+        meterId="synapse-serverless-data-processed",
+    ),
+    # O distrator que obriga o match EXATO de productName: "Serverless Apache
+    # Spark Pool" também contém "Serverless", mas é outro produto e é cobrado
+    # por vCore/HORA. Casar por substring devolveria preço de outra unidade —
+    # e monthly_cost projetaria 730h em cima, não 5 TB.
+    _item(
+        serviceName="Azure Synapse Analytics",
+        productName="Azure Synapse Analytics Serverless Apache Spark Pool - Memory Optimized",
+        skuName="vCore", armSkuName="", meterName="vCore",
+        unitOfMeasure="1 Hour", retailPrice=0.138,
+        meterId="synapse-spark-vcore",
+    ),
+    # Outros eixos do MESMO serviceName, cada um com sua unidade.
+    _item(
+        serviceName="Azure Synapse Analytics",
+        productName="Azure Synapse Analytics Dedicated SQL Pool",
+        skuName="DW1000c", armSkuName="", meterName="100 DWUs",
+        unitOfMeasure="1/Hour", retailPrice=15.1,
+        meterId="synapse-dedicated-dw1000c", isPrimaryMeterRegion=False,
+    ),
+    _item(
+        serviceName="Azure Synapse Analytics",
+        productName="Azure Synapse Analytics Storage",
+        skuName="Standard RA-GRS", armSkuName="",
+        meterName="Standard RA-GRS Data Stored",
+        unitOfMeasure="1 GB/Month", retailPrice=0.0562,
+        meterId="synapse-storage-ragrs",
+    ),
+    _item(
+        serviceName="Azure Synapse Analytics",
+        productName="Azure Synapse Analytics Pipelines",
+        skuName="Operations", armSkuName="", meterName="Operations",
+        unitOfMeasure="50K", retailPrice=0.25, meterId="synapse-pipelines-ops",
+    ),
     # --- Ruído de outra região: descartado pelo filtro de região ----------
     *[
         {**it, "armRegionName": "westeurope", "meterId": f"{it['meterId']}-weu"}
@@ -366,6 +418,7 @@ METER_ESPERADO = {
     "aks-microservices::shared-storage": "blob-hot-lrs",
     "aks-microservices::control-plane-sla": "aks-standard-uptime-sla",
     "data-lakehouse::data-lake-storage": "blob-hot-lrs",
+    "data-lakehouse::synapse-serverless-sql": "synapse-serverless-data-processed",
 }
 
 
@@ -400,12 +453,10 @@ async def test_componente_resolvivel_isola_um_meter(caso_id, comp, api_falsa):
 # tipo, a mensagem ou o caminho mudarem, ela para de reconhecer o bloqueio e
 # quebra em silêncio — por isso cada aspecto está travado abaixo.
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in BLOQUEADOS_COMPS]
-)
+@pytest.mark.parametrize("service", FORA_DE_ESCOPO)
 @respx.mock
-async def test_componente_bloqueado_falha_limpo(caso_id, comp):
-    service = comp["service"]
+async def test_servico_sem_resolver_falha_limpo(service):
+    comp = {"config": {"region": "East US"}}
     # respx SEM rotas: qualquer tentativa de HTTP estoura. O bloqueio tem que
     # ser detectado ANTES de qualquer rede — é o que o torna barato e estável.
     with pytest.raises(PriceResolutionError) as exc_info:
@@ -421,18 +472,26 @@ async def test_componente_bloqueado_falha_limpo(caso_id, comp):
     assert exc.candidates == []
 
 
-@pytest.mark.parametrize(
-    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in BLOQUEADOS_COMPS]
-)
-def test_componente_bloqueado_continua_sem_resolver(caso_id, comp):
-    """Trava que aks/synapse seguem SEM resolver (Fase 4).
+@_params(ALL_COMPONENTS)
+def test_todo_componente_dos_padroes_tem_resolver(comp):
+    """A guarda INVERSA da que existia aqui até 21/08.
 
-    Quando a Fase 4 implementar um deles, este teste falha de propósito: é o
-    lembrete de mover o componente para o conjunto resolvível e travá-lo com
-    meter esperado, em vez de deixá-lo só "não mais bloqueado".
+    Antes, este teste travava que `aks` e `synapse` seguiam SEM resolver, e
+    falhava de propósito quando fossem implementados — foi exatamente o que
+    aconteceu. Agora que os 10 componentes resolvem, o que vale a pena travar
+    é o contrário: nenhum componente pode REGREDIR para "sem resolver", e um
+    padrão novo que traga serviço não suportado tem que declará-lo em
+    BLOQUEADOS conscientemente, não escorregar despercebido.
     """
-    assert comp["service"] not in RESOLVERS
-    assert comp["service"] in BLOQUEADOS
+    assert comp["service"] in RESOLVERS, (
+        f"{comp['id']}: serviço {comp['service']!r} sem resolver. Se for "
+        "intencional, declare-o em BLOQUEADOS."
+    )
+
+    # E os que sobraram em FORA_DE_ESCOPO seguem fora, senão o contrato de
+    # erro que a Skill usa deixaria de ser exercitado por alguém.
+    for service in FORA_DE_ESCOPO:
+        assert service not in RESOLVERS
 
 
 @respx.mock
@@ -448,7 +507,7 @@ async def test_erro_de_bloqueio_se_distingue_de_erro_de_ambiguidade():
     respx.get(BASE_URL).mock(side_effect=_fake_api)
 
     with pytest.raises(PriceResolutionError) as bloqueado:
-        await resolve_price("synapse", {"region": "East US"})
+        await resolve_price(FORA_DE_ESCOPO[0], {"region": "East US"})
 
     # Mesmo serviço válido (sql), mas sem vCores: sobra mais de um meter.
     async with RetailPricesClient() as client:
@@ -572,13 +631,35 @@ async def test_componente_resolvivel_na_api_real(caso_id, comp, has_network):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    ("caso_id", "comp"), [pytest.param(cid, c, id=cid) for cid, c in BLOQUEADOS_COMPS]
-)
-async def test_componente_bloqueado_na_api_real(caso_id, comp, has_network):
+@pytest.mark.parametrize("service", FORA_DE_ESCOPO)
+async def test_servico_sem_resolver_na_api_real(service, has_network):
     """Mesmo com rede, o bloqueio continua sendo o erro limpo (não um timeout)."""
     if not has_network:
         pytest.skip("sem rede: pulando testes de integração")
 
     with pytest.raises(PriceResolutionError, match="Serviço desconhecido"):
-        await resolve_price(comp["service"], comp["config"])
+        await resolve_price(service, {"region": "East US"})
+
+
+@respx.mock
+async def test_synapse_nao_pega_o_spark_pool_nem_o_dedicated(api_falsa):
+    """O serviceName do Synapse cobre eixos de cobrança incompatíveis.
+
+    Sob "Azure Synapse Analytics" convivem serverless SQL (TB processado),
+    Spark pool (vCore/hora), Dedicated SQL (DWU/hora), Pipelines (operações) e
+    Storage (GB/mês). Casar o produto errado não daria erro: daria um NÚMERO,
+    calculado com a unidade de outro eixo.
+    """
+    comp = _comp("data-lakehouse::synapse-serverless-sql")
+    async with api_falsa as client:
+        price = await resolve_price("synapse", comp["config"], client=client)
+
+    assert price.meter_id == "synapse-serverless-data-processed"
+    assert price.unit_of_measure == "1 TB"  # não "1 Hour" do Spark/Dedicated
+    assert monthly_cost(price, comp["usage"]) == pytest.approx(25.0)
+
+
+async def test_synapse_com_tier_sem_resolver_falha_antes_da_rede():
+    """Dedicated/Spark/Pipelines param com erro claro, sem gastar chamada."""
+    with pytest.raises(PriceResolutionError, match="Serverless SQL Pool"):
+        await resolve_price("synapse", {"region": "East US", "tier": "Dedicated SQL Pool"})

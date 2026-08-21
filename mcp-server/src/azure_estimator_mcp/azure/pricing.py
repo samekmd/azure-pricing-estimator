@@ -72,6 +72,7 @@ def monthly_cost(price: PriceResult, usage: dict) -> float:
       "1 Hour"     -> usage['hours'] (default 730h/mês)
       "1 GB/Month" -> usage['gb']
       "1 GB"       -> usage['gb']
+      "1 TB"       -> usage['tbProcessed'] (ou usage['tb'])
       "1/Month"    -> 1 (custo fixo mensal)
       "1 Month"    -> 1
       "1/Day"      -> DAYS_PER_MONTH (custo diário projetado ao mês)
@@ -96,6 +97,20 @@ def monthly_cost(price: PriceResult, usage: dict) -> float:
         if quantity is None:
             raise ValueError(
                 f"usage['gb'] é obrigatório para unit_of_measure {price.unit_of_measure!r}"
+            )
+    elif unit in ("tb/month", "tb"):
+        # Unidade de VOLUME PROCESSADO (Synapse serverless SQL pool: $5/TB
+        # consultado). Aceita as duas chaves de propósito: 'tbProcessed' é o
+        # nome usado nos padrões da Skill, por ser descritivo de "dados
+        # processados"; 'tb' mantém a simetria com 'gb' para quem escrever a
+        # config na mão. Sem default: diferente de horas (onde 730 é o mês
+        # cheio, uma convenção defensável), não existe volume consultado
+        # "padrão" — inventar um seria inventar a conta inteira.
+        quantity = usage.get("tbProcessed", usage.get("tb"))
+        if quantity is None:
+            raise ValueError(
+                f"usage['tbProcessed'] é obrigatório para unit_of_measure "
+                f"{price.unit_of_measure!r} (volume consultado no mês, em TB)"
             )
     elif unit in ("/month", "month"):
         quantity = 1

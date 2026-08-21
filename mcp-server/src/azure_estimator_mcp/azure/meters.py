@@ -248,10 +248,69 @@ def resolve_aks(config: dict) -> Resolver:
     return filters, select
 
 
+# --------------------------------------------------------------------------- #
+# Azure Synapse Analytics — serverless SQL pool, cobrado por TB PROCESSADO.
+#
+# Primeiro serviço do projeto que não é cobrado por tempo nem por capacidade
+# armazenada: o custo acompanha o volume CONSULTADO. Por isso exigiu um
+# mapeamento de unidade novo ("1 TB") em pricing.monthly_cost.
+# --------------------------------------------------------------------------- #
+
+# tier -> productName exato na API. Allowlist de propósito: o serviceName
+# "Azure Synapse Analytics" cobre um catálogo enorme e heterogêneo (Dedicated
+# SQL Pool por DWU/hora, Spark Pool por vCore/hora, Pipelines por operação,
+# Storage por GB/mês, e dezenas de VMs de SSIS), e cada um desses eixos teria
+# config e unidade próprias. Um tier fora desta lista para com erro claro em
+# vez de tentar casar por substring e cair num meter de outro eixo.
+# Chave = grafia canônica aceita em config['tier'] (a comparação é
+# case-insensitive); valor = productName exato na API. Público porque o
+# catalog.py o consome para montar o schema — fonte única da verdade sobre
+# quais motores do Synapse têm resolver.
+SYNAPSE_TIERS = {
+    "Serverless SQL Pool": "Azure Synapse Analytics Serverless SQL Pool",
+}
+_SYNAPSE_TIER_LOOKUP = {k.lower(): v for k, v in SYNAPSE_TIERS.items()}
+
+
+def resolve_synapse(config: dict) -> Resolver:
+    region = config["region"]
+    tier = str(config.get("tier", "Serverless SQL Pool")).strip()
+    price_type = config.get("priceType", "Consumption")
+
+    product = _SYNAPSE_TIER_LOOKUP.get(tier.lower())
+    if product is None:
+        # Falha ANTES da rede: é config inválida, não ausência de meter.
+        raise PriceResolutionError(
+            f"tier {tier!r} não é suportado pelo resolver de Synapse "
+            f"(suportados: {sorted(SYNAPSE_TIERS)}). Dedicated SQL "
+            "Pool, Spark Pool, Pipelines e SSIS são cobrados por outros eixos "
+            "e ainda não têm resolver."
+        )
+
+    filters = {
+        "serviceName": "Azure Synapse Analytics",
+        "armRegionName": region,
+        "priceType": price_type,
+    }
+
+    def select(items: list[dict]) -> dict:
+        # Match EXATO de productName. Substring de "Serverless" pegaria também
+        # o "Serverless Apache Spark Pool", que é outro produto e é cobrado por
+        # vCore/HORA — casaria por engano e devolveria preço de outra unidade.
+        cands = [it for it in items if str(it.get("productName")) == product]
+        # Dentro do produto, o meter de consulta é o "Data Processed".
+        cands = [it for it in cands if _contains(it, "meterName", "Data Processed")]
+        cands = _primary_only(cands)
+        return _select_unique(cands, f"Synapse {tier} 'Data Processed' em {region}")
+
+    return filters, select
+
+
 # Registro serviço -> resolver, usado por pricing.resolve_price.
 RESOLVERS: dict[str, Callable[[dict], Resolver]] = {
     "vm": resolve_vm,
     "storage": resolve_storage,
     "sql": resolve_sql,
     "aks": resolve_aks,
+    "synapse": resolve_synapse,
 }

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..models import FieldSchema, ServiceConfigSchema, ServiceMatch
+from .meters import SYNAPSE_TIERS
 from .retail_client import RetailPricesClient, build_filter, normalize_region
 
 CACHE_TTL_SECONDS = 6 * 60 * 60
@@ -170,6 +171,28 @@ _CATALOG: dict[str, _Service] = {
         ),
         anchor=lambda region: {
             "serviceName": "Azure Kubernetes Service",
+            "armRegionName": region,
+            "skuName": "Standard",
+        },
+    ),
+    "synapse": _Service(
+        key="synapse",
+        service_name="Azure Synapse Analytics",
+        label="Análise de dados (Azure Synapse Analytics)",
+        aliases=(
+            "synapse",
+            "azure synapse",
+            "serverless sql",
+            "sql sob demanda",
+            "data lakehouse",
+            "lakehouse",
+            "data warehouse",
+            "analytics",
+            "analise de dados",
+            "consulta sobre data lake",
+        ),
+        anchor=lambda region: {
+            "serviceName": "Azure Synapse Analytics",
             "armRegionName": region,
             "skuName": "Standard",
         },
@@ -720,11 +743,81 @@ async def _fields_aks(*, region, currency, sample_size, client):
     return campos, exemplo, notas
 
 
+async def _fields_synapse(*, region, currency, sample_size, client):
+    """Campos do serverless SQL pool do Synapse.
+
+    O serviceName "Azure Synapse Analytics" cobre um catálogo heterogêneo
+    (Dedicated SQL Pool por DWU/hora, Spark Pool por vCore/hora, Pipelines por
+    operação, Storage por GB/mês, VMs de SSIS). O resolver cobre só o
+    serverless SQL pool, então o schema só promete esse tier — listar os
+    outros faria o agente montar config que o resolver recusa.
+    """
+    svc = _CATALOG["synapse"]
+    base_probe = {
+        "serviceName": svc.service_name,
+        "armRegionName": region,
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Confirma contra a API que o produto do resolver realmente existe na
+    # região, em vez de afirmar de cabeça.
+    tiers = [
+        tier
+        for tier, produto in SYNAPSE_TIERS.items()
+        if any(str(it.get("productName")) == produto for it in itens)
+    ]
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure. Aceita 'East US' ou 'eastus' — é normalizada.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Motor do Synapse. Só o serverless SQL pool tem resolver hoje.",
+            default="Serverless SQL Pool",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "productName"),
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "Serverless SQL Pool")}
+    notas = [
+        "Cobrado por TB PROCESSADO (volume consultado), não por hora nem por "
+        "capacidade armazenada: estimar exige usage['tbProcessed'].",
+        "Não há default de volume consultado — diferente de horas, onde 730 é "
+        "o mês cheio, aqui um default seria inventar a conta inteira.",
+        "O armazenamento do data lake é OUTRO serviço ('storage'): este meter "
+        "cobre só o motor de consulta sobre ele.",
+    ]
+    return campos, exemplo, notas
+
+
 _BUILDERS: dict[str, Callable] = {
     "vm": _fields_vm,
     "storage": _fields_storage,
     "sql": _fields_sql,
     "aks": _fields_aks,
+    "synapse": _fields_synapse,
 }
 
 

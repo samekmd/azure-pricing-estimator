@@ -71,7 +71,8 @@ Two independent, deliberately decoupled subsystems live under
      work around it with client-side filtering. Note real Gov/DoD regions are
      ordinary slugs (`usgovvirginia`, `usdodeast`) and are not exceptions.
    - `meters.py`: one resolver per service (`resolve_vm`, `resolve_storage`,
-     `resolve_sql`, `resolve_aks`, registered in `RESOLVERS`). Each resolver returns
+     `resolve_sql`, `resolve_aks`, `resolve_synapse`, registered in
+     `RESOLVERS`). Each resolver returns
      `(odata_filters, select_fn)`: filters narrow the API query server-side,
      `select_fn` applies additional disambiguation that can't be expressed as
      an OData filter (e.g. excluding Spot/Windows variants by substring).
@@ -85,14 +86,27 @@ Two independent, deliberately decoupled subsystems live under
      while the 6x pricier `Standard Long Term Support` add-on comes back
      `True`, so filtering on the primary region first would silently return
      the wrong meter — the same trap already documented for on-demand VMs.
+     `resolve_synapse` covers **only** the serverless SQL pool. Its
+     `serviceName` ("Azure Synapse Analytics") spans mutually incompatible
+     billing axes — Dedicated SQL Pool by DWU/hour, Spark Pool by vCore/hour,
+     Pipelines by operation, Storage by GB/month, plus dozens of SSIS VMs —
+     so `SYNAPSE_TIERS` is an allowlist mapping tier to an **exact**
+     `productName`, and an unsupported tier raises before any HTTP call.
+     Matching "Serverless" as a substring would catch the Serverless *Apache
+     Spark* Pool, priced per hour: the wrong product yields a plausible
+     number, not an error.
      Note a resolver existing does not imply the service can be added to the
-     calculator: `aks` resolves a price but has no `config_translate.py`
-     mapping yet, so `add_line_item` refuses it with a clear error.
+     calculator: `aks` and `synapse` resolve prices but have no
+     `config_translate.py` mapping yet, so `add_line_item` refuses them with
+     a clear error.
    - `pricing.py`: `resolve_price()` wires a resolver to `RetailPricesClient`
      and returns a typed `PriceResult` (see `models.py`). `monthly_cost()`
      projects unit price to a monthly cost based on `unit_of_measure` — add
      new unit mappings here rather than guessing at unrecognized units
-     (unrecognized units raise `ValueError` by design). Units are matched
+     (unrecognized units raise `ValueError` by design). `"1 TB"` maps to
+     `usage['tbProcessed']` (alias `usage['tb']`) and has **no default**:
+     unlike hours, where 730 is a defensible full month, there is no
+     "standard" volume queried, so a default would invent the whole bill. Units are matched
      lowercased and stripped, after splitting off the numeric prefix, so
      spelling variants (`"1/Day"`, `"1 /Day"`, `"1 Day"`) hit the same branch —
      keep new mappings in that normalized form. Daily units project with
