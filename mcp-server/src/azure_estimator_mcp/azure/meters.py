@@ -306,6 +306,92 @@ def resolve_synapse(config: dict) -> Resolver:
     return filters, select
 
 
+# --------------------------------------------------------------------------- #
+# Licença do SQL Database — cobrada À PARTE do compute, e SEM região.
+#
+# O meter que resolve_sql escolhe (produto "... General Purpose - Compute
+# Gen5") é a linha de COMPUTE, sem licença. Ela bate no centavo com a linha
+# "Compute" da calculadora, mas o item completo lá custa ~66% mais, porque soma
+# a licença do SQL Server. Até 21/08 isso fazia estimate_monthly_cost
+# SUBESTIMAR qualquer banco com licença inclusa.
+#
+# ONDE ELA ESTAVA ESCONDIDA — duas razões, e as duas já eram armadilhas
+# conhecidas do projeto:
+#
+#   1. armRegionName = "Global". A licença NÃO tem região comercial: é a mesma
+#      no mundo todo (fora US Gov). Procurar em "eastus" devolvia zero e nada
+#      indicava que havia mais o que procurar — exatamente o modo de falha que
+#      _SPECIAL_REGIONS existe para evitar (ver retail_client.py).
+#   2. "License" aparece no productName, não no meterName. O meterName é só
+#      "vCore", então procurar por meterName ~ "License" também dava zero.
+#
+# Confirmado ao vivo em 21/08: 0.099966/h por vCore x 2 vCores x 730h =
+# $145.95 — o valor exato da linha "License" da calculadora.
+# --------------------------------------------------------------------------- #
+
+# tier -> productName EXATO da linha de licença.
+SQL_LICENSE_PRODUCTS = {
+    "General Purpose": (
+        "SQL Database Single/Elastic Pool General Purpose - SQL License"
+    ),
+    "Business Critical": (
+        "SQL Database Single/Elastic Pool Business Critical - SQL License"
+    ),
+    "Hyperscale": "SQL Database SingleDB/Elastic Pool Hyperscale - SQL License",
+}
+_SQL_LICENSE_LOOKUP = {k.lower(): v for k, v in SQL_LICENSE_PRODUCTS.items()}
+
+# A licença é global, com UMA exceção: as regiões Gov têm meter próprio (mais
+# caro — $0.124957/h contra $0.099966/h em GP). Sondado em 21/08.
+_SQL_LICENSE_REGION = "Global"
+_SQL_LICENSE_GOV_REGION = "US Gov"
+
+
+def resolve_sql_license(config: dict) -> Resolver:
+    """Resolve a linha de LICENÇA do SQL Database (preço por vCore/hora).
+
+    ATENÇÃO À UNIDADE: o preço é por **vCore**-hora, não pelo banco inteiro —
+    diferente do meter de compute, cujo skuName já embute a contagem ("2
+    vCore"). Multiplicar pelo número de vCores é responsabilidade de quem
+    projeta o custo; `pricing.sql_monthly_cost` faz isso a partir do
+    config['vCores'].
+    """
+    tier = str(config.get("tier", "General Purpose")).strip()
+    region = str(config.get("region", ""))
+    price_type = config.get("priceType", "Consumption")
+
+    product = _SQL_LICENSE_LOOKUP.get(tier.lower())
+    if product is None:
+        raise PriceResolutionError(
+            f"tier {tier!r} não tem linha de licença mapeada "
+            f"(conhecidos: {sorted(SQL_LICENSE_PRODUCTS)})."
+        )
+
+    # Gov tem meter próprio; o resto do mundo compartilha o "Global".
+    slug = region.lower().replace(" ", "")
+    license_region = (
+        _SQL_LICENSE_GOV_REGION
+        if slug.startswith(("usgov", "usdod"))
+        else _SQL_LICENSE_REGION
+    )
+
+    filters = {
+        "serviceName": "SQL Database",
+        "armRegionName": license_region,
+        "priceType": price_type,
+    }
+
+    def select(items: list[dict]) -> dict:
+        cands = [it for it in items if str(it.get("productName")) == product]
+        # O filtro de priceType já derruba a linha DevTestConsumption, que vem
+        # com o MESMO meterId e preço 0.00 — se ela passasse, _dedup NÃO a
+        # colapsaria (a chave inclui o preço) e sobrariam 2 candidatos.
+        cands = [it for it in cands if str(it.get("type")) == str(price_type)]
+        return _select_unique(cands, f"Licença SQL {tier} ({license_region})")
+
+    return filters, select
+
+
 # Registro serviço -> resolver, usado por pricing.resolve_price.
 RESOLVERS: dict[str, Callable[[dict], Resolver]] = {
     "vm": resolve_vm,
@@ -313,4 +399,5 @@ RESOLVERS: dict[str, Callable[[dict], Resolver]] = {
     "sql": resolve_sql,
     "aks": resolve_aks,
     "synapse": resolve_synapse,
+    "sql_license": resolve_sql_license,
 }

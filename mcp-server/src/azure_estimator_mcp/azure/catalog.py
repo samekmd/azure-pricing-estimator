@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..models import FieldSchema, ServiceConfigSchema, ServiceMatch
-from .meters import SYNAPSE_TIERS
+from .meters import SQL_LICENSE_PRODUCTS, SYNAPSE_TIERS
 from .retail_client import RetailPricesClient, build_filter, normalize_region
 
 CACHE_TTL_SECONDS = 6 * 60 * 60
@@ -195,6 +195,32 @@ _CATALOG: dict[str, _Service] = {
             "serviceName": "Azure Synapse Analytics",
             "armRegionName": region,
             "skuName": "Standard",
+        },
+    ),
+    "sql_license": _Service(
+        key="sql_license",
+        service_name="SQL Database",
+        label="Licença do SQL Database (cobrada à parte do compute)",
+        aliases=(
+            # Só aliases ESPECÍFICOS de licença. Um alias genérico como
+            # "licenca do banco de dados" fazia a busca por "banco de dados"
+            # devolver dois candidatos com o MESMO service_name ("SQL
+            # Database") — convidando o agente a precificar a licença achando
+            # que era o banco.
+            "licenca sql",
+            "licenca do sql",
+            "sql license",
+            "licenciamento sql",
+            "azure hybrid benefit",
+            "ahb",
+        ),
+        # A licença NÃO tem região comercial: o meter vive na pseudo-região
+        # "Global" (fora Gov). A região pedida é ignorada de propósito — quem
+        # decide Global vs "US Gov" é o resolver, a partir do config['region'].
+        anchor=lambda region: {
+            "serviceName": "SQL Database",
+            "armRegionName": "Global",
+            "skuName": "vCore",
         },
     ),
 }
@@ -812,12 +838,80 @@ async def _fields_synapse(*, region, currency, sample_size, client):
     return campos, exemplo, notas
 
 
+async def _fields_sql_license(*, region, currency, sample_size, client):
+    """Campos da linha de LICENÇA do SQL Database.
+
+    Serviço "de apoio", não algo que se pede sozinho: o custo completo de um
+    banco é compute (serviço 'sql') + esta linha. Quem compõe os dois é
+    pricing.sql_monthly_cost, que já é o que estimate_monthly_cost usa para
+    'sql' — este schema existe para quem quiser ITEMIZAR a estimativa.
+    """
+    base_probe = {
+        "serviceName": "SQL Database",
+        "armRegionName": "Global",
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Confirma contra a API quais tiers têm linha de licença de fato.
+    tiers = [
+        tier
+        for tier, produto in SQL_LICENSE_PRODUCTS.items()
+        if any(str(it.get("productName")) == produto for it in itens)
+    ]
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure do banco. A licença é global — a região só decide "
+            "entre o meter comum e o de US Gov, que é mais caro.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Camada de serviço do banco. Cada tier tem sua própria licença.",
+            default="General Purpose",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "productName"),
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "General Purpose")}
+    notas = [
+        "Preço por vCore/HORA — diferente do meter de compute, cujo skuName já "
+        "embute a contagem ('2 vCore'). Multiplique pelo número de vCores.",
+        "O meter vive na pseudo-região 'Global': a licença não varia por "
+        "região comercial (só US Gov tem meter próprio).",
+        "Com Azure Hybrid Benefit (BYOL) esta linha não é cobrada — passe "
+        "licenseIncluded=False para o serviço 'sql'.",
+    ]
+    return campos, exemplo, notas
+
+
 _BUILDERS: dict[str, Callable] = {
     "vm": _fields_vm,
     "storage": _fields_storage,
     "sql": _fields_sql,
     "aks": _fields_aks,
     "synapse": _fields_synapse,
+    "sql_license": _fields_sql_license,
 }
 
 

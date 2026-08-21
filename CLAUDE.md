@@ -71,8 +71,8 @@ Two independent, deliberately decoupled subsystems live under
      work around it with client-side filtering. Note real Gov/DoD regions are
      ordinary slugs (`usgovvirginia`, `usdodeast`) and are not exceptions.
    - `meters.py`: one resolver per service (`resolve_vm`, `resolve_storage`,
-     `resolve_sql`, `resolve_aks`, `resolve_synapse`, registered in
-     `RESOLVERS`). Each resolver returns
+     `resolve_sql`, `resolve_aks`, `resolve_synapse`, `resolve_sql_license`,
+     registered in `RESOLVERS`). Each resolver returns
      `(odata_filters, select_fn)`: filters narrow the API query server-side,
      `select_fn` applies additional disambiguation that can't be expressed as
      an OData filter (e.g. excluding Spot/Windows variants by substring).
@@ -95,6 +95,17 @@ Two independent, deliberately decoupled subsystems live under
      Matching "Serverless" as a substring would catch the Serverless *Apache
      Spark* Pool, priced per hour: the wrong product yields a plausible
      number, not an error.
+     `resolve_sql_license` resolves the SQL Server licence line, which is
+     billed **separately from compute and per vCore-hour**. It hid for a month
+     behind two of the traps this repo already documents: the meter lives in
+     `armRegionName: "Global"` (the licence has no commercial region, so
+     probing `eastus` returned nothing and nothing hinted there was more to
+     find), and the word "License" is in `productName` while `meterName` is
+     just `"vCore"` (so searching meter names also returned nothing). Gov
+     regions have their own, pricier meter (`"US Gov"`). The selector must
+     filter `priceType`: a `DevTestConsumption` twin carries the **same
+     meterId** at $0.00, and `_dedup` will not collapse it because its key
+     includes the price.
      Note a resolver existing does not imply the service can be added to the
      calculator: `aks` and `synapse` resolve prices but have no
      `config_translate.py` mapping yet, so `add_line_item` refuses them with
@@ -113,6 +124,15 @@ Two independent, deliberately decoupled subsystems live under
      `DAYS_PER_MONTH = 30`, a deliberate convention (not 365/12): ×30 is what
      matches Azure's own calculator (verified: ACR Premium $1.6666/day →
      $50/month).
+     `sql_monthly_cost()` composes the two halves of a SQL Database bill —
+     compute plus licence — and is what `estimate_monthly_cost` uses for
+     `sql`. The multiplication by vCores lives there, not in `monthly_cost`,
+     because the count is in `config` and `monthly_cost` only sees `usage`.
+     `config['licenseIncluded']` (default `True`) mirrors the calculator's
+     `softwareBillingOption`: `False` is Azure Hybrid Benefit (BYOL) and drops
+     the licence. Consequence to keep in mind: for `sql`,
+     `estimate_monthly_cost` is **not** `resolve_price` × hours — the former
+     includes the licence, the latter returns only the compute meter.
    - `catalog.py`: discovery layer behind the `search_azure_services` and
      `get_service_config_schema` tools. `_CATALOG` maps each `RESOLVERS` key to
      the exact API `serviceName`, pt-BR/en aliases and a cheap probe filter;
@@ -192,7 +212,10 @@ Two independent, deliberately decoupled subsystems live under
      with nothing on screen saying so. Whatever the config determines is
      emitted explicitly even when it matches the default; what it does not
      determine is returned in `assumptions`/`unsupported` for the caller to
-     show the user, never dropped silently.
+     show the user, never dropped silently. `licenseIncluded` drives
+     `softwareBillingOption` here for the same reason it drives the price in
+     `pricing.py`: it is one decision, and the two halves must not disagree
+     about the same config.
 
 These two subsystems must stay decoupled — pricing lookup must never import
 Playwright, and the calculator client must never call the Retail Prices API

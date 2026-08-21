@@ -357,17 +357,29 @@ def _translate_sql(config: dict, usage: dict, quantity: int) -> Translation:
     # priceType Consumption e o meter dele é on-demand, então os dois radios
     # têm que dizer a mesma coisa.
     ui["databaseBillingOption"] = "payg"
-    ui["softwareBillingOption"] = "license_included"
+    # licenseIncluded espelha exatamente este radio: é a MESMA decisão dos dois
+    # lados do projeto. Desde 21/08 a trilha de preço cobra (ou não) a licença
+    # conforme esse campo (pricing.sql_monthly_cost), então deixá-lo fixo aqui
+    # faria as duas metades discordarem: a estimativa sem licença e o link com
+    # licença, ou vice-versa.
+    license_included = bool(config.get("licenseIncluded", True))
+    ui["softwareBillingOption"] = (
+        "license_included" if license_included else "azure_hybrid_benefit"
+    )
 
     assumptions.append(
         "SQL: 'type' ficou no default da calculadora (=Single Database); o "
         "produto da Retail API é 'Single/Elastic Pool', que não distingue os dois."
     )
     assumptions.append(
-        "SQL: o item da calculadora soma LICENÇA, storage de dados e backup "
-        "às linhas de compute. O meter que resolve_sql escolhe é só o compute "
-        "('... General Purpose - Compute Gen5'), então o total da calculadora "
-        "fica acima do nosso — ver a pendência da trilha de preço no PROGRESS.md."
+        "SQL: o item da calculadora soma storage de dados e backup à linha de "
+        "compute; o nosso número cobre compute + licença. Em GP/Gen5/2 vCore "
+        "isso deixou o total da calculadora ~1,3% acima (storage 32 GB de "
+        "default + backup), não mais os ~66% da licença."
+        if license_included
+        else "SQL: Azure Hybrid Benefit (BYOL) — a licença não é cobrada em "
+        "nenhuma das duas metades. Storage de dados e backup seguem por conta "
+        "da calculadora."
     )
     if quantity != 1:
         unsupported.append(

@@ -38,6 +38,7 @@ from .azure.catalog import DEFAULT_REGION, DEFAULT_SAMPLE
 from .azure.catalog import config_schema as _config_schema
 from .azure.catalog import search_services as _search_services
 from .azure.pricing import monthly_cost as _monthly_cost
+from .azure.pricing import sql_monthly_cost as _sql_monthly_cost
 from .azure.config_translate import translate_config as _translate_config
 from .azure.pricing import resolve_price as _resolve_price
 
@@ -212,7 +213,21 @@ async def estimate_monthly_cost(
     usage: dict[str, Any],
     currency: str = "USD",
 ) -> float:
-    """Estima o custo mensal de um serviço a partir de config + uso."""
+    """Estima o custo mensal de um serviço a partir de config + uso.
+
+    Para `sql` o número devolvido é compute + LICENÇA, não só o compute: a
+    licença do SQL Server é um meter separado (sem região, cobrado por
+    vCore/hora) e responde por ~66% a mais que o compute sozinho. Por isso
+    `vCores` é obrigatório na config de `sql`. Para Azure Hybrid Benefit
+    (BYOL), passe `licenseIncluded: false` e a licença não é somada.
+
+    Consequência: para `sql`, este total NÃO é `resolve_price` x horas —
+    `resolve_price('sql', ...)` devolve só a linha de compute. Para itemizar,
+    resolva também `sql_license` (preço por vCore/hora).
+    """
+    if service == "sql":
+        breakdown = await _sql_monthly_cost(config, usage, currency=currency)
+        return breakdown["total"]
     price = await _resolve_price(service, config, currency=currency)
     return _monthly_cost(price, usage)
 

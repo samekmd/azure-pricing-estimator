@@ -30,7 +30,11 @@ import respx
 import yaml
 
 from azure_estimator_mcp.azure.meters import RESOLVERS, PriceResolutionError
-from azure_estimator_mcp.azure.pricing import monthly_cost, resolve_price
+from azure_estimator_mcp.azure.pricing import (
+    monthly_cost,
+    resolve_price,
+    sql_monthly_cost,
+)
 from azure_estimator_mcp.azure.retail_client import BASE_URL, PAGE_SIZE, RetailPricesClient
 
 # tests/ -> mcp-server/ -> raiz do repo
@@ -294,6 +298,42 @@ FAKE_ITEMS: list[dict] = [
         productName="SQL Database Single/Elastic Pool General Purpose - Storage",
         skuName="Data Stored", armSkuName="", meterName="Data Stored",
         unitOfMeasure="1 GB/Month", retailPrice=0.115, meterId="sql-gp-storage",
+    ),
+    # --- Licença do SQL: outro eixo, e SEM região comercial ----------------
+    # A licença vive em armRegionName="Global" (não em eastus) e a palavra
+    # "License" está no productName, não no meterName — as duas razões de ela
+    # ter passado despercebida até 21/08.
+    _item(
+        serviceName="SQL Database",
+        productName="SQL Database Single/Elastic Pool General Purpose - SQL License",
+        skuName="vCore", armSkuName="", meterName="vCore",
+        unitOfMeasure="1 Hour", retailPrice=0.099966,
+        armRegionName="Global", meterId="sql-license-gp",
+    ),
+    # O GÊMEO PERIGOSO: mesmo meterId, preço 0.00, type=DevTestConsumption.
+    # _dedup NÃO o colapsa (a chave inclui o preço), então sem o filtro de
+    # priceType sobrariam 2 candidatos — ou pior, o de graça.
+    _item(
+        serviceName="SQL Database",
+        productName="SQL Database Single/Elastic Pool General Purpose - SQL License",
+        skuName="vCore", armSkuName="", meterName="vCore",
+        unitOfMeasure="1 Hour", retailPrice=0.0, type="DevTestConsumption",
+        armRegionName="Global", meterId="sql-license-gp",
+    ),
+    _item(
+        serviceName="SQL Database",
+        productName="SQL Database Single/Elastic Pool Business Critical - SQL License",
+        skuName="vCore", armSkuName="", meterName="vCore",
+        unitOfMeasure="1 Hour", retailPrice=0.375,
+        armRegionName="Global", meterId="sql-license-bc",
+    ),
+    # Gov tem meter próprio, mais caro, noutra pseudo-região.
+    _item(
+        serviceName="SQL Database",
+        productName="SQL Database Single/Elastic Pool General Purpose - SQL License",
+        skuName="vCore", armSkuName="", meterName="vCore",
+        unitOfMeasure="1 Hour", retailPrice=0.124957,
+        armRegionName="US Gov", meterId="sql-license-gp-usgov",
     ),
     # --- AKS: control plane. A ARMADILHA está aqui ------------------------
     # Medido na API real (eastus, 21/08): o meter CERTO ("Standard Uptime SLA")
@@ -663,3 +703,126 @@ async def test_synapse_com_tier_sem_resolver_falha_antes_da_rede():
     """Dedicated/Spark/Pipelines param com erro claro, sem gastar chamada."""
     with pytest.raises(PriceResolutionError, match="Serverless SQL Pool"):
         await resolve_price("synapse", {"region": "East US", "tier": "Dedicated SQL Pool"})
+
+
+# --------------------------------------------------------------------------- #
+# Licença do SQL — a pendência aberta desde 20/08, fechada em 21/08.
+#
+# resolve_sql isola a linha de COMPUTE. A licença é um meter à parte, e sem ela
+# estimate_monthly_cost subestimava um banco com licença inclusa em ~66%.
+# --------------------------------------------------------------------------- #
+async def test_licenca_do_sql_vem_da_pseudo_regiao_global(api_falsa):
+    """A licença não tem região comercial — procurá-la em 'eastus' dá zero.
+
+    É a mesma classe de armadilha que _SPECIAL_REGIONS existe para evitar: o
+    meter some em silêncio e nada indica que havia mais o que procurar.
+    """
+    async with api_falsa as client:
+        price = await resolve_price(
+            "sql_license", {"region": "East US", "tier": "General Purpose"},
+            client=client,
+        )
+    assert price.meter_id == "sql-license-gp"
+    assert price.unit_price == pytest.approx(0.099966)
+
+
+async def test_licenca_do_sql_ignora_a_linha_devtest(api_falsa):
+    """O gêmeo DevTestConsumption tem o MESMO meterId e custa 0.00.
+
+    _dedup não o colapsa (a chave inclui o preço), então quem o descarta é o
+    filtro de priceType. Sem ele, a licença sairia de graça — o mesmo erro por
+    baixo que este trabalho veio corrigir.
+    """
+    async with api_falsa as client:
+        price = await resolve_price(
+            "sql_license", {"region": "East US"}, client=client
+        )
+    assert price.unit_price > 0
+    assert price.price_type == "Consumption"
+
+
+async def test_licenca_do_sql_respeita_o_tier(api_falsa):
+    async with api_falsa as client:
+        bc = await resolve_price(
+            "sql_license", {"region": "East US", "tier": "Business Critical"},
+            client=client,
+        )
+    assert bc.meter_id == "sql-license-bc"
+    assert bc.unit_price == pytest.approx(0.375)
+
+
+async def test_licenca_do_sql_em_regiao_gov_usa_o_meter_proprio(api_falsa):
+    """Gov é a única exceção ao 'Global' — e é mais cara."""
+    async with api_falsa as client:
+        price = await resolve_price(
+            "sql_license", {"region": "usgovvirginia"}, client=client
+        )
+    assert price.meter_id == "sql-license-gp-usgov"
+
+
+async def test_licenca_com_tier_sem_mapeamento_falha_claro():
+    with pytest.raises(PriceResolutionError, match="linha de licença"):
+        await resolve_price("sql_license", {"region": "East US", "tier": "Basic"})
+
+
+async def test_custo_do_sql_soma_compute_e_licenca(api_falsa):
+    """O número que a Fase 2 mediu na calculadora: 222.24 + 145.95 = 368.19."""
+    comp = _comp("three-tier-web-app::data-tier")
+    async with api_falsa as client:
+        breakdown = await sql_monthly_cost(comp["config"], comp.get("usage") or {},
+                                           client=client)
+
+    assert breakdown["compute"] == pytest.approx(222.24, abs=0.01)
+    assert breakdown["license"] == pytest.approx(145.95, abs=0.01)
+    assert breakdown["total"] == pytest.approx(368.19, abs=0.01)
+    # A licença é por vCore/hora: 2 vCores dobram a linha, o compute não.
+    assert breakdown["license"] == pytest.approx(
+        0.099966 * 730 * comp["config"]["vCores"], abs=0.01
+    )
+
+
+async def test_azure_hybrid_benefit_nao_cobra_licenca(api_falsa):
+    """licenseIncluded=False espelha o softwareBillingOption=BYOL da UI."""
+    comp = _comp("three-tier-web-app::data-tier")
+    config = {**comp["config"], "licenseIncluded": False}
+    async with api_falsa as client:
+        breakdown = await sql_monthly_cost(config, client=client)
+
+    assert breakdown["license"] == 0.0
+    assert breakdown["total"] == pytest.approx(breakdown["compute"])
+    assert breakdown["license_meter_id"] is None
+
+
+async def test_custo_do_sql_exige_vcores_para_a_licenca(api_falsa):
+    """Sem vCores não dá para calcular uma cobrança POR vCore — para em vez de chutar."""
+    async with api_falsa as client:
+        with pytest.raises(ValueError, match="vCores"):
+            await sql_monthly_cost(
+                {"region": "East US", "tier": "General Purpose"}, client=client
+            )
+
+
+@pytest.mark.integration
+async def test_custo_do_sql_na_api_real_bate_com_a_calculadora(has_network):
+    """Contra a API real: o total do data-tier bate com a calculadora.
+
+    Referência medida na calculadora oficial em 20/08 para esta config exata
+    (GP / Gen5 / 2 vCore / East US): Compute $222.24 + License $145.95 =
+    $368.19. As faixas são largas o bastante para sobreviver a reajuste de
+    preço da Azure, mas estreitas o bastante para pegar meter errado.
+    """
+    if not has_network:
+        pytest.skip("sem rede: pulando testes de integração")
+
+    comp = _comp("three-tier-web-app::data-tier")
+    breakdown = await sql_monthly_cost(comp["config"], comp.get("usage") or {})
+
+    assert breakdown["compute"] > 0 and breakdown["license"] > 0
+    assert breakdown["total"] == pytest.approx(
+        breakdown["compute"] + breakdown["license"]
+    )
+    # A licença é ~66% do compute nesta config — se virar 0% ou 300%, o meter
+    # escolhido mudou de natureza.
+    proporcao = breakdown["license"] / breakdown["compute"]
+    assert 0.4 < proporcao < 1.0, f"proporção licença/compute implausível: {proporcao}"
+    assert 250 < breakdown["total"] < 600, breakdown

@@ -325,3 +325,32 @@ def test_sql_do_padrao_vai_on_demand_com_licenca(caso_id, comp):
     t = translate_config("sql", comp["config"], comp.get("usage") or {})
     assert t.ui_config["databaseBillingOption"] == "payg"
     assert t.ui_config["softwareBillingOption"] == "license_included"
+
+
+# --------------------------------------------------------------------------- #
+# Licença do SQL — a MESMA decisão nas duas metades do projeto (21/08).
+#
+# A trilha de preço passou a cobrar a licença conforme config['licenseIncluded']
+# (pricing.sql_monthly_cost). Se o radio da UI não seguisse o mesmo campo, o
+# custo estimado e o link da calculadora discordariam sobre a mesma config.
+# --------------------------------------------------------------------------- #
+def test_sql_com_licenca_inclusa_marca_pay_as_you_go():
+    t = translate_config("sql", {"region": "East US", "vCores": 2})
+    assert t.ui_config["softwareBillingOption"] == "license_included"
+
+
+def test_sql_com_hybrid_benefit_marca_byol():
+    t = translate_config(
+        "sql", {"region": "East US", "vCores": 2, "licenseIncluded": False}
+    )
+    assert t.ui_config["softwareBillingOption"] == "azure_hybrid_benefit"
+
+
+def test_sql_declara_o_regime_de_licenca_nas_premissas():
+    """O usuário tem que ver qual regime foi aplicado — os dois custam muito diferente."""
+    com = translate_config("sql", {"region": "East US", "vCores": 2})
+    sem = translate_config(
+        "sql", {"region": "East US", "vCores": 2, "licenseIncluded": False}
+    )
+    assert any("compute + licença" in a for a in com.assumptions)
+    assert any("Hybrid Benefit" in a for a in sem.assumptions)
