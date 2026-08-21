@@ -5,12 +5,15 @@ a UI da calculadora já autenticado — a autenticação é delegada a um navega
 real (o jeito que a Microsoft desenhou: cookie + CSRF de uma sessão de verdade).
 
 Os seletores usados abaixo foram mapeados ao vivo (DOM real, sessão
-autenticada) em 06/08. Preferência de estabilidade: `data-testid` > `name`/
-`id` de campo > classe Fluent UI (hash, evitada sempre que possível).
+autenticada) em 06/08 e os de sessão revalidados em 21/08. Preferência de
+estabilidade: `data-testid` > `name`/`id` de campo > classe Fluent UI (hash,
+evitada sempre que possível).
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +25,69 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from azure_estimator_mcp.models import AddLineItemResult
+
 CALCULATOR_URL = "https://azure.microsoft.com/en-us/pricing/calculator/"
+
+# Os dois sinais de estado de sessão, EXCLUSIVOS entre si. Ambos conferidos ao
+# vivo em 21/08, cada um no seu estado (deslogado: contexto novo sem
+# storage_state; logado: .auth/storage_state.json recém-bootstrapado):
+#
+#                        deslogado   logado
+#   _SIGN_IN_BUTTON        count 1   count 0
+#   _USER_DISPLAY          count 0   count 1
+#
+# Checar os dois, e não um só, é o que torna a checagem revalidável: com um
+# sinal só, se a calculadora renomear aquele nó a resposta trava numa das duas
+# (sempre "deslogado" se olhamos só o widget de conta; sempre "logado" se
+# olhamos só o botão de login) e nada denuncia. Com os dois, "nenhum apareceu"
+# é um estado detectável — vira erro explícito em vez de palpite.
+_SIGN_IN_BUTTON = '[data-testid="stickyCostHeader__signInButton"]'
+_USER_DISPLAY = "#user-display"  # dentro de .calc-login, o widget de conta da SPA
+
+# Deslogado, Save/Share do menu "..." NÃO ficam desabilitados como se supunha:
+# seguem com is_enabled() == True e embutem um <a href="/auth/signin/...">
+# rotulado "Log in to Share". Clicar navega pro login em vez de abrir o dialog
+# — era daí que vinha o timeout de 10s esperando .share-modal.
+_SHARE_LOGIN_LINK = 'a[href*="/auth/signin"]'
+
+# Margem pra hidratação da SPA antes de decidir o estado da sessão.
+_AUTH_PROBE_TIMEOUT_MS = 8000
+
+
+class CalculatorAuthStateUnknownError(RuntimeError):
+    """Nenhum dos dois sinais de sessão apareceu — o DOM mudou.
+
+    Separado de CalculatorSessionExpiredError de propósito: refazer o
+    bootstrap não conserta seletor obsoleto. Aqui o recado é pra quem mantém o
+    módulo (revalidar contra a página real), não pro usuário final.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Não foi possível determinar o estado da sessão: nem "
+            f"'{_SIGN_IN_BUTTON}' (deslogado) nem '{_USER_DISPLAY}' (logado) "
+            "apareceram. Provável mudança no DOM da calculadora — revalidar os "
+            "seletores contra a página real."
+        )
+
+
+class CalculatorSessionExpiredError(RuntimeError):
+    """A sessão salva em .auth/storage_state.json não está mais autenticada.
+
+    Não há auto-refresh por design (ver CLAUDE.md): a saída é refazer o
+    bootstrap manual. A mensagem já diz isso pra falha não chegar ao usuário
+    como um timeout genérico do Playwright.
+    """
+
+    def __init__(self, detalhe: str = "") -> None:
+        msg = (
+            "Sessão da calculadora expirada ou inválida. Rode de novo: "
+            "make bootstrap-login (ou uv run python "
+            "mcp-server/scripts/bootstrap_login.py)."
+        )
+        super().__init__(f"{msg} {detalhe}".strip())
+
 
 # Serviço (chave de RESOLVERS em meters.py / _CATALOG em catalog.py) -> testid
 # do botão "Add to estimate" no product picker. Cada testid aparece 2x no DOM
@@ -94,18 +159,27 @@ _VM_OS_BILLING_PREFIXES = {
 class AzureCalculatorClient:
     """Context manager async que abre a calculadora com uma sessão já logada.
 
-    A auth NÃO é renovada automaticamente: se a sessão expirou, is_authenticated
-    retorna False e cabe a você rodar o bootstrap_login.py de novo. O ponto de
-    usar navegador é justamente delegar a autenticação a ele.
+    A auth NÃO é renovada automaticamente: se a sessão expirou,
+    is_authenticated retorna False (ou ensure_authenticated levanta
+    CalculatorSessionExpiredError) e cabe a você rodar o bootstrap_login.py de
+    novo. O ponto de usar navegador é justamente delegar a autenticação a ele.
+
+    Os passos que dirigem a UI passam por _with_retry: a calculadora é uma SPA
+    lenta e um timeout isolado costuma ser transitório. Sessão expirada, ao
+    contrário, não é retentável — falha na primeira tentativa, com instrução.
     """
 
     def __init__(
         self,
         storage_state_path: str = ".auth/storage_state.json",
         headless: bool = True,
+        max_retries: int = 2,
+        backoff_base: float = 0.5,
     ) -> None:
         self.storage_state_path = Path(storage_state_path)
         self.headless = headless
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -137,17 +211,51 @@ class AzureCalculatorClient:
             await self._playwright.stop()
             self._playwright = None
 
+    async def _with_retry(
+        self, acao: Callable[[], Awaitable[Any]], descricao: str
+    ) -> Any:
+        """Executa `acao()` com retry e backoff exponencial em timeout da UI.
+
+        Mesma convenção do retry HTTP de retail_client.py
+        (`backoff_base * 2**tentativa`), pelo mesmo motivo: a falha típica aqui
+        é transitória (SPA lenta, painel que ainda não montou).
+
+        Só PlaywrightTimeoutError é retentado. CalculatorSessionExpiredError
+        não é: repetir o fluxo numa sessão morta só multiplica esperas de 10s e
+        atrasa a única mensagem útil. ValueError/NotImplementedError também
+        passam direto — retry não conserta seletor ausente nem SKU indisponível.
+        """
+        last_exc: PlaywrightTimeoutError | None = None
+        for tentativa in range(self._max_retries + 1):
+            try:
+                return await acao()
+            except PlaywrightTimeoutError as exc:
+                last_exc = exc
+                if tentativa < self._max_retries:
+                    await asyncio.sleep(self._backoff_base * (2**tentativa))
+
+        assert last_exc is not None
+        raise PlaywrightTimeoutError(
+            f"{descricao}: falhou após {self._max_retries + 1} tentativas. "
+            f"Último erro: {last_exc}"
+        )
+
     async def is_authenticated(self) -> bool:
         """Reporta se a sessão carregada está logada NA CALCULADORA.
 
-        A calculadora (SPA) tem seu PRÓPRIO widget de conta, independente do
-        header global da Microsoft — que continua mostrando "Sign in" mesmo com
-        você autenticado. Por isso o sinal confiável é o botão de conta da
-        calculadora (#user-display, dentro de .calc-login), que só aparece
-        quando a sessão está válida. Seletor calibrado contra a página real.
+        A calculadora (SPA) tem seu PRÓPRIO estado de conta, independente do
+        header global da Microsoft — que mostra "Sign in" mesmo com você
+        autenticado, e por isso nunca serviu de sinal.
 
-        TODO: o DOM do estado DESLOGADO não foi capturado (exigiria invalidar a
-        sessão); se o layout da calculadora mudar, revalidar este seletor.
+        A checagem é pela PRESENÇA de um dos dois sinais exclusivos descritos
+        em _SIGN_IN_BUTTON/_USER_DISPLAY — botão de login => deslogado, widget
+        de conta => logado. Nenhum dos dois levanta
+        CalculatorAuthStateUnknownError em vez de chutar um dos lados: ausência
+        não é evidência aqui, e um palpite calado é exatamente o modo de falha
+        que a regra "não adivinhar" (meters.py) existe pra evitar.
+
+        Os dois estados foram confirmados ao vivo em 21/08, cada um contra o
+        DOM real — nenhum deles é suposição.
         """
         if self._context is None:
             raise RuntimeError(
@@ -157,16 +265,39 @@ class AzureCalculatorClient:
 
         page = await self._context.new_page()
         try:
-            await page.goto(CALCULATOR_URL, wait_until="networkidle")
-            user_display = page.locator("#user-display")
+            await self._with_retry(
+                lambda: page.goto(CALCULATOR_URL, wait_until="networkidle"),
+                "Carregar a calculadora",
+            )
+            # A SPA hidrata os dois widgets tarde; espera o primeiro que vier.
             try:
-                await user_display.wait_for(state="visible", timeout=8000)
-                return True
+                await page.locator(
+                    f"{_SIGN_IN_BUTTON}, {_USER_DISPLAY}"
+                ).first.wait_for(state="visible", timeout=_AUTH_PROBE_TIMEOUT_MS)
             except PlaywrightTimeoutError:
-                # Widget de conta da calculadora não apareceu -> sessão inválida.
+                raise CalculatorAuthStateUnknownError() from None
+
+            # Ordem importa: na dúvida (os dois presentes num frame de
+            # transição), "deslogado" é o palpite seguro — manda refazer o
+            # bootstrap em vez de seguir e falhar lá na frente, no export.
+            if await page.locator(_SIGN_IN_BUTTON).count() > 0:
                 return False
+            if await page.locator(_USER_DISPLAY).count() > 0:
+                return True
+            raise CalculatorAuthStateUnknownError()
         finally:
             await page.close()
+
+    async def ensure_authenticated(self) -> None:
+        """Levanta CalculatorSessionExpiredError se a sessão não estiver válida.
+
+        Versão imperativa de is_authenticated(), pra quem só quer seguir o fluxo
+        e não tratar um bool. Chame antes de create_estimate() num fluxo longo:
+        descobrir a expiração no fim, já com os line items montados, desperdiça
+        toda a montagem.
+        """
+        if not await self.is_authenticated():
+            raise CalculatorSessionExpiredError()
 
     async def create_estimate(self) -> None:
         """Abre uma aba nova na calculadora com uma estimativa vazia.
@@ -180,8 +311,12 @@ class AzureCalculatorClient:
                 "(async with AzureCalculatorClient() as client: ...)."
             )
 
-        self._page = await self._context.new_page()
-        await self._page.goto(CALCULATOR_URL, wait_until="networkidle")
+        page = await self._context.new_page()
+        self._page = page
+        await self._with_retry(
+            lambda: page.goto(CALCULATOR_URL, wait_until="networkidle"),
+            "Abrir a calculadora",
+        )
 
         # Banner de cookies (opcional — só aparece na primeira visita da
         # sessão de navegador). Rejeita não-essenciais por padrão.
@@ -190,7 +325,9 @@ class AzureCalculatorClient:
         except PlaywrightTimeoutError:
             pass
 
-    async def add_line_item(self, service: str, config: dict[str, Any]) -> None:
+    async def add_line_item(
+        self, service: str, config: dict[str, Any], strict: bool = True
+    ) -> AddLineItemResult:
         """Adiciona um serviço à estimativa e aplica os campos de config.
 
         `service` usa as mesmas chaves de RESOLVERS (meters.py) / _CATALOG
@@ -206,10 +343,19 @@ class AzureCalculatorClient:
           "reserved_1yr", "azure_hybrid_benefit").
 
         Para storage/sql, os campos além de _SIMPLE_SELECT_FIELDS (busca de
-        instância, quantidade, radios de blob/database billing) ainda não
-        têm seletor mapeado. Um campo desconhecido levanta NotImplementedError
-        em vez de ser ignorado silenciosamente — mesma regra dos resolvers em
-        meters.py: não adivinhar.
+        instância, quantidade, radios de blob/database billing) ainda não têm
+        seletor mapeado.
+
+        `strict=True` (padrão) levanta NotImplementedError nesses campos, em vez
+        de ignorá-los calado — mesma regra dos resolvers em meters.py: não
+        adivinhar. `strict=False` é a saída explícita pra quem prefere uma
+        estimativa parcial a nenhuma: aplica o que tem seletor e devolve os
+        pulados em AddLineItemResult.ignored_fields.
+
+        A escolha é de quem chama porque o custo do erro muda com o campo: pular
+        "region" ou "capacity" muda o preço do link exportado sem avisar. Ou
+        seja, com strict=False, `ignored_fields` não-vazio precisa chegar ao
+        usuário junto com o link — o parcial é útil, o parcial silencioso não.
 
         Observação: com múltiplos itens do mesmo serviço na estimativa, os
         seletores usam a última cópia do campo no DOM (`.last`) — ainda não
@@ -236,11 +382,12 @@ class AzureCalculatorClient:
             }
 
         unknown_fields = set(config) - select_fields - extra_fields
-        if unknown_fields:
+        if unknown_fields and strict:
             raise NotImplementedError(
                 f"Campo(s) {sorted(unknown_fields)} de '{service}' ainda não "
                 "têm seletor mapeado (instância/quantidade/billing de "
-                "storage e sql, por exemplo, são follow-up)."
+                "storage e sql, por exemplo, são follow-up). "
+                "Use strict=False para aplicar o resto assim mesmo."
             )
 
         # O testid aparece 2x no DOM (aba "Popular" + aba da categoria); só a
@@ -251,6 +398,8 @@ class AzureCalculatorClient:
         await self._page.wait_for_timeout(500)
 
         for field, value in config.items():
+            if field in unknown_fields:
+                continue  # só chega aqui com strict=False; vai em ignored_fields
             if field in select_fields:
                 select = self._page.locator(f'select[name="{field}"]').last
                 await select.select_option(label=value)
@@ -266,6 +415,12 @@ class AzureCalculatorClient:
                 await self._click_billing_radio(_VM_COMPUTE_BILLING_PREFIXES, value, "computeBillingOption")
             elif field == "osBillingOption":
                 await self._click_billing_radio(_VM_OS_BILLING_PREFIXES, value, "osBillingOption")
+
+        return AddLineItemResult(
+            service=service,
+            applied_fields=sorted(set(config) - unknown_fields),
+            ignored_fields=sorted(unknown_fields),
+        )
 
     async def _apply_vm_size(self, search_text: str) -> None:
         """Digita no combobox INSTANCE (#size) e clica a primeira sugestão.
@@ -315,18 +470,39 @@ class AzureCalculatorClient:
 
         Fluxo real (menu "..." > Share): abre um dialog (`.share-modal`) com
         o link num `<textarea readonly name="link">` — não é um `<input>` nem
-        um `<a href>`, então o valor sai por `input_value()`. Requer sessão
-        autenticada (Save/Share ficam desabilitados, com "Log in to Share",
-        quando deslogado — is_authenticated() já cobre essa checagem).
+        um `<a href>`, então o valor sai por `input_value()`.
+
+        Requer sessão autenticada. Atenção: deslogado, Share NÃO fica
+        desabilitado (a suposição anterior aqui) — segue clicável e vira um
+        link pro /auth/signin, então o clique navegava pra fora e só falhava
+        10s depois, esperando um .share-modal que nunca ia montar. Por isso o
+        pre-flight abaixo, que troca esse timeout por CalculatorSessionExpiredError.
         """
         if self._page is None:
             raise RuntimeError("Chame create_estimate() antes de export_estimate().")
 
-        page = self._page
-        await page.locator('[data-testid="stickyCostHeader__moreMenuButton"]').click()
-        await page.locator('[data-testid="moreOptionsMenuList__share"]').click()
+        return await self._with_retry(self._export_estimate_once, "Export da estimativa")
 
-        dialog = page.locator(".share-modal[role=\"dialog\"]")
+    async def _export_estimate_once(self) -> str:
+        """Uma tentativa do fluxo de share. Ver export_estimate()."""
+        page = self._page
+        assert page is not None
+
+        await page.locator('[data-testid="stickyCostHeader__moreMenuButton"]').click()
+        share_item = page.locator('[data-testid="moreOptionsMenuList__share"]')
+        await share_item.wait_for(state="visible", timeout=8000)
+
+        # Pre-flight: o link de login dentro do item Share é o sinal de sessão
+        # morta mais próximo do ponto de uso — checar aqui evita clicar e
+        # esperar o dialog que não vem.
+        if await share_item.locator(_SHARE_LOGIN_LINK).count() > 0:
+            raise CalculatorSessionExpiredError(
+                'O menu Share está oferecendo "Log in to Share".'
+            )
+
+        await share_item.click()
+
+        dialog = page.locator('.share-modal[role="dialog"]')
         link_field = dialog.locator('textarea[name="link"]')
         await link_field.wait_for(state="visible", timeout=10000)
         link = await link_field.input_value()
