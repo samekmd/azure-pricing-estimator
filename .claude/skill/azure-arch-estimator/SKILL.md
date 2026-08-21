@@ -18,8 +18,9 @@ description: >
 > correspondentes em `server.py` ainda não foram ligados a ela — ver
 > "Limitações atuais" no fim do arquivo. Os arquivos
 > `reference/interpretation-guide.md` e `reference/validation-rules.md`
-> (Fase 3) vão aprofundar as regras de casamento de padrão e validação;
-> aqui fica só o essencial para já testar a fatia vertical.
+> aprofundam as regras de casamento de padrão e validação; aqui fica o
+> fluxo operacional, use os dois arquivos de referência quando precisar
+> do critério por trás de uma decisão específica.
 
 ## O que essa Skill faz
 
@@ -61,6 +62,11 @@ que nenhum padrão casou e por isso o fluxo seguiu para o passo 2
 (fallback). Essa declaração deve aparecer na resposta final ao usuário,
 não apenas no raciocínio interno.
 
+> Para critérios mais profundos (múltiplos padrões casando ao mesmo
+> tempo, quando ajustar o padrão casado versus tratar como fallback,
+> quando perguntar ao usuário versus assumir um valor), veja
+> `reference/interpretation-guide.md`.
+
 ### 2. Fallback — extrair componentes sem padrão
 
 Quando não houver casamento por keyword, não adivinhe: use as tools de
@@ -90,6 +96,10 @@ montar a config.
      descrição do usuário for ambígua a ponto de você não ter confiança
      de qual serviço ele quer, pergunte antes de seguir em vez de
      chutar.
+
+   > Critério mais detalhado de quando a ambiguidade justifica perguntar,
+   > e como decompor uma descrição com vários componentes em buscas
+   > separadas, está em `reference/interpretation-guide.md`.
 
 2. **Descobrir os campos de config.** Com a `key` (ou o `service_name`)
    em mãos, chame:
@@ -187,6 +197,10 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
   `export_estimate` já existe em `calculator_client.py`, mas os tools do
   MCP ainda não foram ligados a ela (ver limitações).
 
+> Checklist completo de autovalidação antes de apresentar a estimativa, e
+> a regra sobre o que pode virar valor numérico na resposta para
+> componentes bloqueados, estão em `reference/validation-rules.md`.
+
 ## Serviços suportados hoje
 
 Só estes três têm resolver funcional em `meters.py` — são os únicos que
@@ -226,6 +240,9 @@ Ao montar uma estimativa que inclua um destes, informe claramente ao
 usuário que aquele componente específico não tem preço disponível ainda,
 mas siga precificando o restante da arquitetura normalmente.
 
+> Regras detalhadas de como tratar um componente bloqueado sem travar o
+> resto da estimativa estão em `reference/validation-rules.md`.
+
 ## Erros esperados
 
 - `PriceResolutionError` — o resolver não conseguiu isolar exatamente um
@@ -237,6 +254,10 @@ mas siga precificando o restante da arquitetura normalmente.
   enquanto.
 - Serviço fora de `vm`/`storage`/`sql` — trate como bloqueado (ver seção
   acima), não como erro de config.
+
+> Detalhamento de cada causa de `PriceResolutionError` e como confirmar
+> valores fora da amostra truncada de um campo estão em
+> `reference/validation-rules.md`.
 
 ## Limitações atuais
 
@@ -250,6 +271,3 @@ mas siga precificando o restante da arquitetura normalmente.
 - `quantity` dos componentes não é somado automaticamente por nenhuma tool
   — a soma é feita pela Skill na hora de apresentar o resultado (passo 4).
 - Serviços `aks` e `synapse` não têm resolver — ver seção acima.
-- `interpretation-guide.md` e `validation-rules.md` (Fase 3) ainda não
-  existem; até lá, este arquivo concentra as regras mínimas de
-  interpretação e validação.
