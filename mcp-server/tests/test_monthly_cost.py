@@ -57,3 +57,40 @@ def test_unidades_ja_cobertas_nao_regridem():
     assert monthly_cost(_price("1/Month", 4.2), {}) == pytest.approx(4.2)
     with pytest.raises(ValueError):
         monthly_cost(_price("1 GB/Month"), {})
+
+
+# --------------------------------------------------------------------------- #
+# TB processado — a unidade que o Synapse serverless trouxe (21/08).
+#
+# Primeiro eixo de cobrança do projeto que não é tempo nem capacidade
+# armazenada: o custo acompanha o volume CONSULTADO.
+# --------------------------------------------------------------------------- #
+def test_tb_processado_usa_o_volume_consultado():
+    # Synapse serverless SQL pool em eastus: $5/TB. 5 TB no mês = $25.
+    assert monthly_cost(_price("1 TB", 5.0), {"tbProcessed": 5}) == pytest.approx(25.0)
+
+
+def test_tb_aceita_o_alias_curto():
+    """'tbProcessed' é o nome nos padrões; 'tb' mantém a simetria com 'gb'."""
+    assert monthly_cost(_price("1 TB", 5.0), {"tb": 5}) == pytest.approx(25.0)
+
+
+def test_tb_respeita_o_fator_numerico_da_unidade():
+    assert monthly_cost(_price("10 TB", 50.0), {"tbProcessed": 5}) == pytest.approx(25.0)
+
+
+def test_tb_sem_volume_levanta_em_vez_de_assumir_um_default():
+    """Não existe volume consultado 'padrão'.
+
+    Diferente de horas, onde 730 é o mês cheio e é uma convenção defensável,
+    aqui um default seria inventar a conta inteira — um número plausível e
+    errado é pior que um erro claro.
+    """
+    with pytest.raises(ValueError, match="tbProcessed"):
+        monthly_cost(_price("1 TB", 5.0), {})
+
+
+def test_tb_nao_se_confunde_com_gb():
+    """usage['gb'] não satisfaz um meter cobrado em TB."""
+    with pytest.raises(ValueError, match="tbProcessed"):
+        monthly_cost(_price("1 TB", 5.0), {"gb": 5000})

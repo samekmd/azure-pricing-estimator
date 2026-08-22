@@ -19,6 +19,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
+    "pyyaml>=6.0.2",
 ]
 
 [tool.pytest.ini_options]
@@ -26,6 +27,7 @@ testpaths = ["mcp-server/tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: testes que batem na API real (pulados sem rede)",
+    "browser: testes que abrem a calculadora num Chromium real (sem efeito colateral; não exigem sessão)",
 ]
 
 [build-system]

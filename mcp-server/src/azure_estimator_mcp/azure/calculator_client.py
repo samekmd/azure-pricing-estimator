@@ -5,14 +5,14 @@ a UI da calculadora já autenticado — a autenticação é delegada a um navega
 real (o jeito que a Microsoft desenhou: cookie + CSRF de uma sessão de verdade).
 
 Os seletores usados abaixo foram mapeados ao vivo (DOM real, sessão
-autenticada) em 06/08 e os de sessão revalidados em 21/08. Preferência de
-estabilidade: `data-testid` > `name`/`id` de campo > classe Fluent UI (hash,
-evitada sempre que possível).
+autenticada) em 06/08. Preferência de estabilidade: `data-testid` > `name`/
+`id` de campo > classe Fluent UI (hash, evitada sempre que possível).
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -25,69 +25,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from azure_estimator_mcp.models import AddLineItemResult
-
 CALCULATOR_URL = "https://azure.microsoft.com/en-us/pricing/calculator/"
-
-# Os dois sinais de estado de sessão, EXCLUSIVOS entre si. Ambos conferidos ao
-# vivo em 21/08, cada um no seu estado (deslogado: contexto novo sem
-# storage_state; logado: .auth/storage_state.json recém-bootstrapado):
-#
-#                        deslogado   logado
-#   _SIGN_IN_BUTTON        count 1   count 0
-#   _USER_DISPLAY          count 0   count 1
-#
-# Checar os dois, e não um só, é o que torna a checagem revalidável: com um
-# sinal só, se a calculadora renomear aquele nó a resposta trava numa das duas
-# (sempre "deslogado" se olhamos só o widget de conta; sempre "logado" se
-# olhamos só o botão de login) e nada denuncia. Com os dois, "nenhum apareceu"
-# é um estado detectável — vira erro explícito em vez de palpite.
-_SIGN_IN_BUTTON = '[data-testid="stickyCostHeader__signInButton"]'
-_USER_DISPLAY = "#user-display"  # dentro de .calc-login, o widget de conta da SPA
-
-# Deslogado, Save/Share do menu "..." NÃO ficam desabilitados como se supunha:
-# seguem com is_enabled() == True e embutem um <a href="/auth/signin/...">
-# rotulado "Log in to Share". Clicar navega pro login em vez de abrir o dialog
-# — era daí que vinha o timeout de 10s esperando .share-modal.
-_SHARE_LOGIN_LINK = 'a[href*="/auth/signin"]'
-
-# Margem pra hidratação da SPA antes de decidir o estado da sessão.
-_AUTH_PROBE_TIMEOUT_MS = 8000
-
-
-class CalculatorAuthStateUnknownError(RuntimeError):
-    """Nenhum dos dois sinais de sessão apareceu — o DOM mudou.
-
-    Separado de CalculatorSessionExpiredError de propósito: refazer o
-    bootstrap não conserta seletor obsoleto. Aqui o recado é pra quem mantém o
-    módulo (revalidar contra a página real), não pro usuário final.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            "Não foi possível determinar o estado da sessão: nem "
-            f"'{_SIGN_IN_BUTTON}' (deslogado) nem '{_USER_DISPLAY}' (logado) "
-            "apareceram. Provável mudança no DOM da calculadora — revalidar os "
-            "seletores contra a página real."
-        )
-
-
-class CalculatorSessionExpiredError(RuntimeError):
-    """A sessão salva em .auth/storage_state.json não está mais autenticada.
-
-    Não há auto-refresh por design (ver CLAUDE.md): a saída é refazer o
-    bootstrap manual. A mensagem já diz isso pra falha não chegar ao usuário
-    como um timeout genérico do Playwright.
-    """
-
-    def __init__(self, detalhe: str = "") -> None:
-        msg = (
-            "Sessão da calculadora expirada ou inválida. Rode de novo: "
-            "make bootstrap-login (ou uv run python "
-            "mcp-server/scripts/bootstrap_login.py)."
-        )
-        super().__init__(f"{msg} {detalhe}".strip())
-
 
 # Serviço (chave de RESOLVERS em meters.py / _CATALOG em catalog.py) -> testid
 # do botão "Add to estimate" no product picker. Cada testid aparece 2x no DOM
@@ -98,6 +36,35 @@ _PICKER_TESTIDS: dict[str, str] = {
     "storage": "storage-picker-item",
     "sql": "azure-sql-database-picker-item",
 }
+
+# CONTAINER DE UM ITEM — sondado ao vivo em 21/08. Cada serviço adicionado à
+# estimativa vira um <div id="<slug>-<GUID>-layout"> que contém TODOS os campos
+# daquele item e nada de outro item; `div[id$="-layout"]` bate exatamente na
+# lista de itens (sem extras) e a ordem no DOM é a ordem de inserção.
+#
+# O <slug> é o prefixo do testid do picker ("virtual-machines-picker-item" ->
+# "virtual-machines"), e o <GUID> é O MESMO que aparece nos ids dos radios de
+# billing (radio-payg-<GUID>-computeBillingOption) — ou seja, escopar pelo
+# container já escopa os radios de graça.
+#
+# Por que isso importa e não é cosmético: com duas VMs na estimativa o
+# documento tem DOIS elementos com id="size" (id duplicado, HTML inválido mas
+# real). Enquanto os campos eram resolvidos por `.last`, só dava para tocar o
+# ÚLTIMO item — adicionar funcionava, editar não.
+_ITEM_LAYOUT_SELECTOR = 'div[id$="-layout"]'
+_ITEM_ID_RE = re.compile(
+    r"^(?P<slug>.+)-"
+    r"(?P<guid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})-layout$"
+)
+_SLUG_TO_SERVICE: dict[str, str] = {
+    testid.removesuffix("-picker-item"): service
+    for service, testid in _PICKER_TESTIDS.items()
+}
+
+# Âncora de "o painel do item terminou de montar": todo serviço tem exatamente
+# um <select name="region"> no seu painel.
+_ITEM_READY_ANCHOR = 'select[name="region"]'
 
 # Campos de config que são <select name="..."> simples dentro do painel do
 # item já adicionado — mapeáveis direto por select_option(label=...). Campos
@@ -115,6 +82,8 @@ _SIMPLE_SELECT_FIELDS: dict[str, set[str]] = {
         "fileStructure",
         "accessTier",
         "redundancy",
+        "storageUnits",  # unidade da capacidade: GB/TB
+        "blobDataRetrievalUnits",
     },
     "sql": {
         "region",
@@ -131,6 +100,31 @@ _SIMPLE_SELECT_FIELDS: dict[str, set[str]] = {
 # Campos de texto simples (<input>, sem widget de busca) do painel de VM.
 # "count"/"hours" têm name= e id= iguais; select_option cobre a unidade.
 _VM_TEXT_INPUT_FIELDS = {"count", "hours"}
+
+# Idem para storage. ATENÇÃO ao "count": o name é o MESMO da VM, mas o
+# significado é outro — na VM é número de instâncias, aqui é a CAPACIDADE
+# (em GB ou TB, conforme o <select storageUnits>). Como os campos são
+# resolvidos dentro do container do item, não há ambiguidade de seletor; a
+# ambiguidade é de leitura, daí este aviso. NÃO há campo de quantidade de
+# contas de storage: para contas separadas, adicione o item mais de uma vez.
+_STORAGE_TEXT_INPUT_FIELDS = {
+    "count",  # capacidade
+    "blobWriteOperations",
+    "blobCreateContainerOperations",
+    "blobReadOperations",
+    "blobOtherOperations",
+    "blobDataRetrieval",
+}
+_TEXT_INPUT_FIELDS = _VM_TEXT_INPUT_FIELDS | _STORAGE_TEXT_INPUT_FIELDS
+
+# Billing do storage. Diferente do SQL, o default aqui JÁ é "Pay as you go"
+# (confirmado ao vivo em 20/08) — mas o campo é emitido explicitamente do
+# mesmo jeito, pela mesma razão: default não é escolha.
+_STORAGE_BILLING_PREFIXES = {
+    "payg": "radio-payg-",
+    "reserved_1yr": "radio-one-year-",
+    "reserved_3yr": "radio-three-year-",
+}
 
 # O campo INSTANCE (#size) é um combobox com busca (react-select) — digitar
 # filtra e abre um <div role="option"> com o texto completo do SKU (ex.:
@@ -155,18 +149,63 @@ _VM_OS_BILLING_PREFIXES = {
     "azure_hybrid_benefit": "radio-ahb-",  # Azure Hybrid Benefit
 }
 
+# SQL Database tem DOIS grupos de radio, e os dois vêm com um default que NÃO
+# é pay-as-you-go — medido ao vivo em 20/08:
+#   databaseBillingOption -> "3 year reserved (~55% discount)"
+#   softwareBillingOption -> "Bring Your Own License (Azure Hybrid Benefit)"
+# Ou seja: um item de SQL adicionado sem tocar nesses radios é precificado como
+# reserva de 3 anos SEM licença — ~53% abaixo do preço on-demand que a Retail
+# Prices API devolve. Não dá para deixar no default; ver config_translate.py.
+_SQL_DATABASE_BILLING_PREFIXES = {
+    "payg": "radio-payg-",
+    "savings_1yr": "radio-sv-one-year-",
+    "savings_3yr": "radio-sv-three-year-",
+    "reserved_1yr": "radio-one-year-",
+    "reserved_3yr": "radio-three-year-",
+}
+# Só DUAS opções, confirmadas por sondagem em 21/08 com o painel em General
+# Purpose / Provisioned / Gen5: "Pay as you go" e "Bring Your Own License
+# (Azure Hybrid Benefit)". Havia aqui um "savings_1yr" -> "radio-sv-one-year-"
+# que NÃO existe no DOM: o grupo de licença não tem savings plan (só o de
+# compute tem). Pedir essa chave morria num timeout de 30s do Playwright
+# procurando um radio inexistente. Removido.
+_SQL_SOFTWARE_BILLING_PREFIXES = {
+    "license_included": "radio-payg-",  # "Pay as you go" = licença inclusa
+    "azure_hybrid_benefit": "radio-ahb-",  # BYOL
+}
+
+
+# Widget de conta DA CALCULADORA (não o header global da Microsoft, que mostra
+# "Sign in" mesmo logado). Deslogado, o container inteiro some do DOM — medido
+# em 20/08 e reconfirmado em 21/08: #user-display e .calc-login com count=0 e um
+# <div class="card-login"> "Log in to save cost estimates…" no lugar.
+_ACCOUNT_WIDGET = "#user-display"
+_LOGGED_OUT_CARD = "div.card-login"
+
+_BOOTSTRAP_HINT = (
+    "Rode novamente: uv run python mcp-server/scripts/bootstrap_login.py"
+)
+
+
+class CalculatorAuthError(RuntimeError):
+    """A sessão salva não está (mais) logada na calculadora.
+
+    Tipo próprio de propósito: quem chama precisa distinguir "refaça o
+    bootstrap" de "algo quebrou", e essa é a falha operacional mais comum do
+    projeto — não há renovação automática por design.
+    """
+
 
 class AzureCalculatorClient:
     """Context manager async que abre a calculadora com uma sessão já logada.
 
-    A auth NÃO é renovada automaticamente: se a sessão expirou,
-    is_authenticated retorna False (ou ensure_authenticated levanta
-    CalculatorSessionExpiredError) e cabe a você rodar o bootstrap_login.py de
-    novo. O ponto de usar navegador é justamente delegar a autenticação a ele.
+    A auth NÃO é renovada automaticamente: se a sessão expirou, is_authenticated
+    retorna False e cabe a você rodar o bootstrap_login.py de novo. O ponto de
+    usar navegador é justamente delegar a autenticação a ele.
 
-    Os passos que dirigem a UI passam por _with_retry: a calculadora é uma SPA
-    lenta e um timeout isolado costuma ser transitório. Sessão expirada, ao
-    contrário, não é retentável — falha na primeira tentativa, com instrução.
+    Os passos que dependem da rede ou da hidratação da SPA passam por
+    _with_retry: contra uma UI real, um timeout isolado costuma ser
+    transitório. Sessão expirada, ao contrário, não é retentável.
     """
 
     def __init__(
@@ -217,13 +256,14 @@ class AzureCalculatorClient:
         """Executa `acao()` com retry e backoff exponencial em timeout da UI.
 
         Mesma convenção do retry HTTP de retail_client.py
-        (`backoff_base * 2**tentativa`), pelo mesmo motivo: a falha típica aqui
-        é transitória (SPA lenta, painel que ainda não montou).
+        (`backoff_base * 2**tentativa`), pelo mesmo motivo: a falha típica é
+        transitória (rede, SPA lenta, painel que ainda não montou).
 
-        Só PlaywrightTimeoutError é retentado. CalculatorSessionExpiredError
-        não é: repetir o fluxo numa sessão morta só multiplica esperas de 10s e
-        atrasa a única mensagem útil. ValueError/NotImplementedError também
-        passam direto — retry não conserta seletor ausente nem SKU indisponível.
+        Só PlaywrightTimeoutError é retentado. CalculatorAuthError não é —
+        repetir numa sessão morta só multiplica a espera e atrasa a única
+        mensagem útil, a de refazer o bootstrap. ValueError/NotImplementedError
+        também passam direto: retry não conserta config inválida nem seletor
+        que mudou de nome.
         """
         last_exc: PlaywrightTimeoutError | None = None
         for tentativa in range(self._max_retries + 1):
@@ -243,19 +283,20 @@ class AzureCalculatorClient:
     async def is_authenticated(self) -> bool:
         """Reporta se a sessão carregada está logada NA CALCULADORA.
 
-        A calculadora (SPA) tem seu PRÓPRIO estado de conta, independente do
-        header global da Microsoft — que mostra "Sign in" mesmo com você
-        autenticado, e por isso nunca serviu de sinal.
+        A calculadora (SPA) tem seu PRÓPRIO widget de conta, independente do
+        header global da Microsoft — que continua mostrando "Sign in" mesmo com
+        você autenticado. Por isso o sinal confiável é o botão de conta da
+        calculadora (#user-display, dentro de .calc-login), que só aparece
+        quando a sessão está válida. Seletor calibrado contra a página real.
 
-        A checagem é pela PRESENÇA de um dos dois sinais exclusivos descritos
-        em _SIGN_IN_BUTTON/_USER_DISPLAY — botão de login => deslogado, widget
-        de conta => logado. Nenhum dos dois levanta
-        CalculatorAuthStateUnknownError em vez de chutar um dos lados: ausência
-        não é evidência aqui, e um palpite calado é exatamente o modo de falha
-        que a regra "não adivinhar" (meters.py) existe pra evitar.
+        Validado nos DOIS estados: logado, #user-display fica visível;
+        deslogado, #user-display e .calc-login somem do DOM (count=0 — o
+        container inteiro é removido, não escondido) e aparece um
+        <div class="card-login">. Capturado ao vivo em 20/08 e reconfirmado em
+        21/08, quando a sessão expirou sozinha.
 
-        Os dois estados foram confirmados ao vivo em 21/08, cada um contra o
-        DOM real — nenhum deles é suposição.
+        ABRE UMA PÁGINA NOVA a cada chamada (goto + networkidle): use
+        _page_is_authenticated() quando já houver uma página aberta.
         """
         if self._context is None:
             raise RuntimeError(
@@ -269,35 +310,15 @@ class AzureCalculatorClient:
                 lambda: page.goto(CALCULATOR_URL, wait_until="networkidle"),
                 "Carregar a calculadora",
             )
-            # A SPA hidrata os dois widgets tarde; espera o primeiro que vier.
+            user_display = page.locator(_ACCOUNT_WIDGET)
             try:
-                await page.locator(
-                    f"{_SIGN_IN_BUTTON}, {_USER_DISPLAY}"
-                ).first.wait_for(state="visible", timeout=_AUTH_PROBE_TIMEOUT_MS)
-            except PlaywrightTimeoutError:
-                raise CalculatorAuthStateUnknownError() from None
-
-            # Ordem importa: na dúvida (os dois presentes num frame de
-            # transição), "deslogado" é o palpite seguro — manda refazer o
-            # bootstrap em vez de seguir e falhar lá na frente, no export.
-            if await page.locator(_SIGN_IN_BUTTON).count() > 0:
-                return False
-            if await page.locator(_USER_DISPLAY).count() > 0:
+                await user_display.wait_for(state="visible", timeout=8000)
                 return True
-            raise CalculatorAuthStateUnknownError()
+            except PlaywrightTimeoutError:
+                # Widget de conta da calculadora não apareceu -> sessão inválida.
+                return False
         finally:
             await page.close()
-
-    async def ensure_authenticated(self) -> None:
-        """Levanta CalculatorSessionExpiredError se a sessão não estiver válida.
-
-        Versão imperativa de is_authenticated(), pra quem só quer seguir o fluxo
-        e não tratar um bool. Chame antes de create_estimate() num fluxo longo:
-        descobrir a expiração no fim, já com os line items montados, desperdiça
-        toda a montagem.
-        """
-        if not await self.is_authenticated():
-            raise CalculatorSessionExpiredError()
 
     async def create_estimate(self) -> None:
         """Abre uma aba nova na calculadora com uma estimativa vazia.
@@ -325,13 +346,77 @@ class AzureCalculatorClient:
         except PlaywrightTimeoutError:
             pass
 
-    async def add_line_item(
-        self, service: str, config: dict[str, Any], strict: bool = True
-    ) -> AddLineItemResult:
-        """Adiciona um serviço à estimativa e aplica os campos de config.
+    def _item_root(self, item_id: str):
+        """Locator da RAIZ de um item. Todos os campos são resolvidos dentro dela.
+
+        Escopar por aqui é o que torna a estimativa endereçável: sem isso os
+        campos eram resolvidos por `.last` e só o último item era alcançável.
+        """
+        assert self._page is not None
+        return self._page.locator(f'div[id="{item_id}"]')
+
+    @staticmethod
+    def service_of_item(item_id: str) -> str:
+        """Descobre o serviço a partir do id do container (o slug do prefixo)."""
+        match = _ITEM_ID_RE.match(item_id)
+        if match is None:
+            raise ValueError(
+                f"item_id {item_id!r} não tem o formato "
+                "'<serviço>-<GUID>-layout' devolvido por add_line_item()."
+            )
+        slug = match.group("slug")
+        service = _SLUG_TO_SERVICE.get(slug)
+        if service is None:
+            raise ValueError(
+                f"Item do tipo {slug!r} não é um serviço mapeado "
+                f"(conhecidos: {sorted(_SLUG_TO_SERVICE)})."
+            )
+        return service
+
+    @staticmethod
+    def _allowed_fields(service: str) -> tuple[set[str], set[str]]:
+        """(selects simples, demais campos) aceitos por um serviço."""
+        select_fields = _SIMPLE_SELECT_FIELDS.get(service, set())
+        extra_fields: set[str] = set()
+        if service == "vm":
+            extra_fields = _VM_TEXT_INPUT_FIELDS | {
+                "hoursFactor",
+                _VM_SIZE_FIELD,
+                "computeBillingOption",
+                "osBillingOption",
+            }
+        elif service == "sql":
+            extra_fields = {"databaseBillingOption", "softwareBillingOption"}
+        elif service == "storage":
+            extra_fields = _STORAGE_TEXT_INPUT_FIELDS | {"blobBillingOption"}
+        return select_fields, extra_fields
+
+    def _validate_fields(self, service: str, config: dict[str, Any]) -> None:
+        """Recusa campo sem seletor mapeado ANTES de tocar a página.
+
+        Mesma regra dos resolvers em meters.py: não adivinhar. E a validação
+        vem antes do clique de propósito — uma config inválida não deve deixar
+        um item pela metade na estimativa.
+        """
+        select_fields, extra_fields = self._allowed_fields(service)
+        unknown_fields = set(config) - select_fields - extra_fields
+        if unknown_fields:
+            raise NotImplementedError(
+                f"Campo(s) {sorted(unknown_fields)} de '{service}' ainda não "
+                f"têm seletor mapeado (aceitos: "
+                f"{sorted(select_fields | extra_fields)})."
+            )
+
+    async def add_line_item(self, service: str, config: dict[str, Any]) -> str:
+        """Adiciona um serviço à estimativa, aplica a config e devolve o item_id.
 
         `service` usa as mesmas chaves de RESOLVERS (meters.py) / _CATALOG
         (catalog.py): "vm", "storage", "sql".
+
+        O retorno é o id do container do item recém-criado
+        ("virtual-machines-<GUID>-layout"). Guarde-o: é o endereço do item para
+        edit_line_item() — com vários itens do mesmo serviço na estimativa, é a
+        única forma de dizer QUAL deles se quer mexer.
 
         Campos aceitos em `config`:
         - Os listados em _SIMPLE_SELECT_FIELDS (selects nativos do painel).
@@ -342,24 +427,20 @@ class AzureCalculatorClient:
           _VM_COMPUTE_BILLING_PREFIXES/_VM_OS_BILLING_PREFIXES, ex.:
           "reserved_1yr", "azure_hybrid_benefit").
 
-        Para storage/sql, os campos além de _SIMPLE_SELECT_FIELDS (busca de
-        instância, quantidade, radios de blob/database billing) ainda não têm
-        seletor mapeado.
+        - Só para "sql": "databaseBillingOption" (payg/savings/reserved) e
+          "softwareBillingOption" (license_included/azure_hybrid_benefit).
+          NÃO omita os dois: os defaults da calculadora são "3 year reserved"
+          e "Azure Hybrid Benefit", que precificam ~53% abaixo do on-demand.
 
-        `strict=True` (padrão) levanta NotImplementedError nesses campos, em vez
-        de ignorá-los calado — mesma regra dos resolvers em meters.py: não
-        adivinhar. `strict=False` é a saída explícita pra quem prefere uma
-        estimativa parcial a nenhuma: aplica o que tem seletor e devolve os
-        pulados em AddLineItemResult.ignored_fields.
+        - Só para "storage": _STORAGE_TEXT_INPUT_FIELDS (capacidade em
+          "count" + unidade em "storageUnits", e os contadores de operações)
+          e "blobBillingOption". ATENÇÃO: no painel de storage o "count" é a
+          CAPACIDADE, não a quantidade de contas (na VM o mesmo name significa
+          número de instâncias). Não há campo de quantidade de contas: para
+          contas separadas, chame add_line_item() mais de uma vez.
 
-        A escolha é de quem chama porque o custo do erro muda com o campo: pular
-        "region" ou "capacity" muda o preço do link exportado sem avisar. Ou
-        seja, com strict=False, `ignored_fields` não-vazio precisa chegar ao
-        usuário junto com o link — o parcial é útil, o parcial silencioso não.
-
-        Observação: com múltiplos itens do mesmo serviço na estimativa, os
-        seletores usam a última cópia do campo no DOM (`.last`) — ainda não
-        há como mirar um item específico por índice/id.
+        Campo desconhecido levanta NotImplementedError em vez de ser ignorado
+        em silêncio — mesma regra dos resolvers em meters.py: não adivinhar.
         """
         if self._page is None:
             raise RuntimeError("Chame create_estimate() antes de add_line_item().")
@@ -370,79 +451,139 @@ class AzureCalculatorClient:
                 f"Serviço '{service}' sem seletor mapeado "
                 f"(esperado um de {sorted(_PICKER_TESTIDS)})."
             )
-
-        select_fields = _SIMPLE_SELECT_FIELDS.get(service, set())
-        extra_fields: set[str] = set()
-        if service == "vm":
-            extra_fields = _VM_TEXT_INPUT_FIELDS | {
-                "hoursFactor",
-                _VM_SIZE_FIELD,
-                "computeBillingOption",
-                "osBillingOption",
-            }
-
-        unknown_fields = set(config) - select_fields - extra_fields
-        if unknown_fields and strict:
-            raise NotImplementedError(
-                f"Campo(s) {sorted(unknown_fields)} de '{service}' ainda não "
-                "têm seletor mapeado (instância/quantidade/billing de "
-                "storage e sql, por exemplo, são follow-up). "
-                "Use strict=False para aplicar o resto assim mesmo."
-            )
+        self._validate_fields(service, config)
 
         # O testid aparece 2x no DOM (aba "Popular" + aba da categoria); só a
         # cópia visível é clicável.
         add_button = self._page.locator(f'[data-testid="{testid}"]:visible').first
+
+        # O painel do item novo é montado de forma ASSÍNCRONA, e demora mais
+        # conforme a estimativa cresce (medido ao vivo: ~1.1s com 3 itens já
+        # na lista). Antes aqui havia uma espera fixa de 500ms — uma corrida:
+        # se o painel ainda não existisse, o `.last` dos campos resolvia para o
+        # item ANTERIOR e o select_option morria num timeout de 30s procurando
+        # um rótulo que não existe naquele serviço (ex.: "Block Blob Storage"
+        # no <select type> de um item SQL). Esperamos o painel APARECER, não o
+        # relógio: o container de índice `antes` e, dentro dele, a âncora que
+        # indica que os campos já foram renderizados.
+        itens = self._page.locator(_ITEM_LAYOUT_SELECTOR)
+        antes = await itens.count()
         await add_button.click()
-        # Painel de config do item recém-adicionado leva um instante pra montar.
-        await self._page.wait_for_timeout(500)
+
+        novo = itens.nth(antes)
+        await novo.wait_for(state="attached", timeout=15000)
+        await novo.locator(_ITEM_READY_ANCHOR).wait_for(state="attached", timeout=15000)
+
+        item_id = await novo.get_attribute("id")
+        if not item_id:
+            raise RuntimeError(
+                "O painel do item foi criado sem id — o layout da calculadora "
+                "mudou; revalide _ITEM_LAYOUT_SELECTOR contra o DOM real."
+            )
+
+        await self._apply_fields(self._item_root(item_id), service, config)
+        return item_id
+
+    async def edit_line_item(self, item_id: str, config: dict[str, Any]) -> None:
+        """Reaplica campos num item JÁ adicionado, endereçado pelo item_id.
+
+        `item_id` é o que add_line_item() devolveu. O serviço é deduzido do
+        próprio id (o slug do prefixo), então não há como pedir a edição de um
+        item de VM com campos de storage por engano.
+
+        Só os campos passados são tocados; o resto do item fica como está.
+        """
+        if self._page is None:
+            raise RuntimeError("Chame create_estimate() antes de edit_line_item().")
+
+        service = self.service_of_item(item_id)
+        self._validate_fields(service, config)
+
+        root = self._item_root(item_id)
+        if await root.count() == 0:
+            raise ValueError(
+                f"Item {item_id!r} não está na estimativa aberta. Ele veio de "
+                "outra estimativa, ou create_estimate() foi chamado de novo "
+                "(o que recomeça do zero e invalida os ids anteriores)."
+            )
+        await self._apply_fields(root, service, config)
+
+    async def _apply_fields(
+        self, root, service: str, config: dict[str, Any]
+    ) -> None:
+        """Aplica os campos DENTRO da raiz de um item.
+
+        A ordem de iteração do dict é preservada de propósito: trocar um select
+        remonta as opções dos de baixo (mudar vcoreTier refaz a lista de
+        instanceSize; a unidade de storage tem que vir antes da capacidade,
+        senão 500 é lido na unidade errada). Quem garante a ordem certa é o
+        config_translate.py, que emite do grosso para o fino.
+        """
+        select_fields, _ = self._allowed_fields(service)
 
         for field, value in config.items():
-            if field in unknown_fields:
-                continue  # só chega aqui com strict=False; vai em ignored_fields
             if field in select_fields:
-                select = self._page.locator(f'select[name="{field}"]').last
-                await select.select_option(label=value)
-            elif field in _VM_TEXT_INPUT_FIELDS:
-                await self._page.locator(f'input[name="{field}"]').last.fill(str(value))
+                await root.locator(f'select[name="{field}"]').select_option(label=value)
+            elif field in _TEXT_INPUT_FIELDS:
+                await root.locator(f'input[name="{field}"]').fill(str(value))
             elif field == "hoursFactor":
-                await self._page.locator('select[name="hoursFactor"]').last.select_option(
+                await root.locator('select[name="hoursFactor"]').select_option(
                     label=value
                 )
             elif field == _VM_SIZE_FIELD:
-                await self._apply_vm_size(value)
+                await self._apply_vm_size(root, value)
             elif field == "computeBillingOption":
-                await self._click_billing_radio(_VM_COMPUTE_BILLING_PREFIXES, value, "computeBillingOption")
+                await self._click_billing_radio(
+                    root, _VM_COMPUTE_BILLING_PREFIXES, value, "computeBillingOption"
+                )
             elif field == "osBillingOption":
-                await self._click_billing_radio(_VM_OS_BILLING_PREFIXES, value, "osBillingOption")
+                await self._click_billing_radio(
+                    root, _VM_OS_BILLING_PREFIXES, value, "osBillingOption"
+                )
+            elif field == "databaseBillingOption":
+                await self._click_billing_radio(
+                    root, _SQL_DATABASE_BILLING_PREFIXES, value, "databaseBillingOption"
+                )
+            elif field == "softwareBillingOption":
+                await self._click_billing_radio(
+                    root, _SQL_SOFTWARE_BILLING_PREFIXES, value, "softwareBillingOption"
+                )
+            elif field == "blobBillingOption":
+                await self._click_billing_radio(
+                    root, _STORAGE_BILLING_PREFIXES, value, "blobBillingOption"
+                )
 
-        return AddLineItemResult(
-            service=service,
-            applied_fields=sorted(set(config) - unknown_fields),
-            ignored_fields=sorted(unknown_fields),
-        )
-
-    async def _apply_vm_size(self, search_text: str) -> None:
-        """Digita no combobox INSTANCE (#size) e clica a primeira sugestão.
+    async def _apply_vm_size(self, root, search_text: str) -> None:
+        """Digita no combobox INSTANCE (#size) do item e clica a sugestão.
 
         Widget é um react-select: digitar dispara uma busca assíncrona que
         renderiza <div role="option"> com o SKU completo (ex. "D4s v3: 4
         vCPUs, ..."). `search_text` deve ser específico o bastante pra
         deixar uma opção só (ex. o skuName, não só a série), senão o
         `.first` pode acabar escolhendo o SKU errado.
+
+        As opções são renderizadas DENTRO do container do item (sondado em
+        21/08: não é um portal no <body>), então o escopo por item vale para
+        elas também — importante porque com duas VMs na estimativa existem
+        dois elementos com id="size" no documento.
         """
-        assert self._page is not None
-        size_input = self._page.locator("#size").last
+        size_input = root.locator("#size")
         await size_input.click()
         await size_input.fill(search_text)
-        option = self._page.locator('[role="option"]:visible').first
+        option = root.locator('[role="option"]:visible').first
         await option.wait_for(state="visible", timeout=10000)
         await option.click()
 
     async def _click_billing_radio(
-        self, prefixes: dict[str, str], key: str, group_suffix: str
+        self, root, prefixes: dict[str, str], key: str, group_suffix: str
     ) -> None:
-        """Clica o radio de billing correspondente a `key`.
+        """Clica o radio de billing correspondente a `key`, dentro do item.
+
+        O id real embute o GUID do item
+        (radio-<prefixo>-<GUID>-computeBillingOption), então localizamos pelo
+        prefixo estável do id, não pelo texto do label (o label de savings plan
+        inclui um "~X% discount" que varia por SKU/região). Como a busca é
+        feita dentro da raiz do item, o GUID não precisa ser reconstruído.
 
         Algumas opções (ex.: "1 year reserved") ficam desabilitadas pela
         própria calculadora dependendo do SKU/região escolhido ("1 year
@@ -451,13 +592,24 @@ class AzureCalculatorClient:
         rápido e com uma mensagem clara, em vez de esperar o timeout padrão
         do Playwright tentando clicar num elemento desabilitado.
         """
-        assert self._page is not None
         prefix = prefixes.get(key)
         if prefix is None:
             raise ValueError(
                 f"Opção de billing '{key}' desconhecida (esperado um de {sorted(prefixes)})."
             )
-        radio = self._page.locator(f'input[id^="{prefix}"][id$="-{group_suffix}"]').last
+        radio = root.locator(f'input[id^="{prefix}"][id$="-{group_suffix}"]')
+        # Alguns grupos são CONDICIONAIS: existem ou não conforme o resto da
+        # config. Medido em 21/08: `osBillingOption` (Azure Hybrid Benefit do
+        # SO) só é montado quando operatingSystem=Windows — com Linux o grupo
+        # inteiro some do DOM. Sem esta checagem, pedir a opção nesse estado
+        # morre num timeout de 30s do Playwright em vez de explicar o motivo.
+        if await radio.count() == 0:
+            raise ValueError(
+                f"O grupo '{group_suffix}' não existe no painel deste item. "
+                "Ou a opção não se aplica à config escolhida (ex.: "
+                "osBillingOption só existe para Windows), ou o layout da "
+                "calculadora mudou."
+            )
         if not await radio.is_enabled():
             raise ValueError(
                 f"Opção de billing '{key}' está desabilitada para o SKU/região "
@@ -465,42 +617,73 @@ class AzureCalculatorClient:
             )
         await radio.click()
 
+    async def _page_is_authenticated(self) -> bool:
+        """Checa a sessão NA PÁGINA JÁ ABERTA — sem abrir outra nem navegar.
+
+        is_authenticated() faz um goto + networkidle numa página nova, o que é
+        caro para uma checagem que acontece logo antes de um clique numa página
+        que já está carregada.
+        """
+        assert self._page is not None
+        return await self._page.locator(_ACCOUNT_WIDGET).count() > 0
+
     async def export_estimate(self) -> str:
-        """Clica em Compartilhar e devolve o link gerado pela calculadora.
+        """Compartilha a estimativa aberta e devolve o link gerado.
 
         Fluxo real (menu "..." > Share): abre um dialog (`.share-modal`) com
         o link num `<textarea readonly name="link">` — não é um `<input>` nem
         um `<a href>`, então o valor sai por `input_value()`.
 
-        Requer sessão autenticada. Atenção: deslogado, Share NÃO fica
-        desabilitado (a suposição anterior aqui) — segue clicável e vira um
-        link pro /auth/signin, então o clique navegava pra fora e só falhava
-        10s depois, esperando um .share-modal que nunca ia montar. Por isso o
-        pre-flight abaixo, que troca esse timeout por CalculatorSessionExpiredError.
+        EXIGE SESSÃO AUTENTICADA, e a checagem é feita aqui. Cuidado que já
+        custou caro: o item "Share" do menu NÃO fica desabilitado quando
+        deslogado. Medido ao vivo: ele continua `visible=True enabled=True`,
+        com o texto "Share\nLog in to Share" — o "Log in to Share" é rótulo,
+        não `disabled`. Sem esta checagem, chamar deslogado clicava, o
+        `.share-modal` nunca abria e o método morria num TimeoutError de 10s do
+        Playwright, contrariando a disciplina de falha limpa do resto do
+        projeto.
         """
         if self._page is None:
             raise RuntimeError("Chame create_estimate() antes de export_estimate().")
 
-        return await self._with_retry(self._export_estimate_once, "Export da estimativa")
+        if not await self._page_is_authenticated():
+            raise CalculatorAuthError(
+                "Não dá para compartilhar a estimativa: a sessão da calculadora "
+                f"expirou ou não está logada. {_BOOTSTRAP_HINT}"
+            )
 
-    async def _export_estimate_once(self) -> str:
-        """Uma tentativa do fluxo de share. Ver export_estimate()."""
+        page = self._page
+        try:
+            # O retry fica DENTRO do try: só depois de esgotar as tentativas o
+            # timeout vira a mensagem de "layout mudou" — antes disso ainda
+            # pode ser lentidão passageira, que é o caso comum.
+            link = await self._with_retry(
+                self._open_share_dialog, "Export da estimativa"
+            )
+        except PlaywrightTimeoutError as exc:
+            # Cinto e suspensório: a checagem acima cobre o caso conhecido
+            # (deslogado); isto cobre mudança de layout do menu/dialog, que
+            # também chegaria como timeout opaco.
+            raise RuntimeError(
+                "O diálogo de compartilhamento não abriu no tempo esperado. "
+                "Se a sessão estiver válida, os seletores do menu Share podem "
+                f"ter mudado no layout da calculadora. Detalhe: {exc}"
+            ) from exc
+
+        return link
+
+    async def _open_share_dialog(self) -> str:
+        """Uma tentativa do fluxo de share: abre o dialog, lê o link e fecha.
+
+        Fecha o dialog antes de devolver justamente para ser reexecutável: se
+        uma tentativa morrer no meio, a próxima encontra o menu no mesmo estado
+        em que começou.
+        """
         page = self._page
         assert page is not None
 
         await page.locator('[data-testid="stickyCostHeader__moreMenuButton"]').click()
-        share_item = page.locator('[data-testid="moreOptionsMenuList__share"]')
-        await share_item.wait_for(state="visible", timeout=8000)
-
-        # Pre-flight: o link de login dentro do item Share é o sinal de sessão
-        # morta mais próximo do ponto de uso — checar aqui evita clicar e
-        # esperar o dialog que não vem.
-        if await share_item.locator(_SHARE_LOGIN_LINK).count() > 0:
-            raise CalculatorSessionExpiredError(
-                'O menu Share está oferecendo "Log in to Share".'
-            )
-
-        await share_item.click()
+        await page.locator('[data-testid="moreOptionsMenuList__share"]').click()
 
         dialog = page.locator('.share-modal[role="dialog"]')
         link_field = dialog.locator('textarea[name="link"]')

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..models import FieldSchema, ServiceConfigSchema, ServiceMatch
+from .meters import SQL_LICENSE_PRODUCTS, SYNAPSE_TIERS
 from .retail_client import RetailPricesClient, build_filter, normalize_region
 
 CACHE_TTL_SECONDS = 6 * 60 * 60
@@ -150,6 +151,76 @@ _CATALOG: dict[str, _Service] = {
             "serviceName": "SQL Database",
             "armRegionName": region,
             "skuName": "2 vCore",
+        },
+    ),
+    "aks": _Service(
+        key="aks",
+        service_name="Azure Kubernetes Service",
+        label="Kubernetes gerenciado (Azure Kubernetes Service)",
+        aliases=(
+            "aks",
+            "kubernetes",
+            "k8s",
+            "cluster",
+            "clusters",
+            "container orchestration",
+            "orquestracao de containers",
+            "microsservicos",
+            "microservicos",
+            "microservices",
+        ),
+        anchor=lambda region: {
+            "serviceName": "Azure Kubernetes Service",
+            "armRegionName": region,
+            "skuName": "Standard",
+        },
+    ),
+    "synapse": _Service(
+        key="synapse",
+        service_name="Azure Synapse Analytics",
+        label="Análise de dados (Azure Synapse Analytics)",
+        aliases=(
+            "synapse",
+            "azure synapse",
+            "serverless sql",
+            "sql sob demanda",
+            "data lakehouse",
+            "lakehouse",
+            "data warehouse",
+            "analytics",
+            "analise de dados",
+            "consulta sobre data lake",
+        ),
+        anchor=lambda region: {
+            "serviceName": "Azure Synapse Analytics",
+            "armRegionName": region,
+            "skuName": "Standard",
+        },
+    ),
+    "sql_license": _Service(
+        key="sql_license",
+        service_name="SQL Database",
+        label="Licença do SQL Database (cobrada à parte do compute)",
+        aliases=(
+            # Só aliases ESPECÍFICOS de licença. Um alias genérico como
+            # "licenca do banco de dados" fazia a busca por "banco de dados"
+            # devolver dois candidatos com o MESMO service_name ("SQL
+            # Database") — convidando o agente a precificar a licença achando
+            # que era o banco.
+            "licenca sql",
+            "licenca do sql",
+            "sql license",
+            "licenciamento sql",
+            "azure hybrid benefit",
+            "ahb",
+        ),
+        # A licença NÃO tem região comercial: o meter vive na pseudo-região
+        # "Global" (fora Gov). A região pedida é ignorada de propósito — quem
+        # decide Global vs "US Gov" é o resolver, a partir do config['region'].
+        anchor=lambda region: {
+            "serviceName": "SQL Database",
+            "armRegionName": "Global",
+            "skuName": "vCore",
         },
     ),
 }
@@ -612,10 +683,235 @@ async def _fields_sql(*, region, currency, sample_size, client):
     return campos, exemplo, notas
 
 
+async def _fields_aks(*, region, currency, sample_size, client):
+    """Campos do control plane do AKS.
+
+    Cobre SÓ a taxa do control plane gerenciado. Os nós do cluster são VMs
+    comuns: quem os precifica é o serviço 'vm' — não há nada de AKS neles.
+    """
+    svc = _CATALOG["aks"]
+    base_probe = {
+        "serviceName": svc.service_name,
+        "armRegionName": region,
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Só os skuName que têm de fato um meter de control plane que o resolver
+    # sabe escolher ("Uptime SLA" / "Long Term Support"). Sondado em 21/08:
+    # isso deixa "Standard". Ficam de fora "Automatic" (AKS Automatic, que tem
+    # meters próprios — "Automatic Hosted Control Plane" e um por categoria de
+    # nó) e os "Anyscale …". Listá-los aqui faria o agente montar uma config
+    # que o resolver recusa; o schema promete só o que resolve.
+    _METERS_DE_CONTROL_PLANE = ("uptime sla", "long term support")
+    tiers = sorted(
+        {
+            str(it.get("skuName"))
+            for it in itens
+            if any(
+                alvo in str(it.get("meterName", "")).lower()
+                for alvo in _METERS_DE_CONTROL_PLANE
+            )
+        }
+    )
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure. Aceita 'East US' ou 'eastus' — é normalizada.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Camada do control plane. O tier gratuito do AKS não tem meter na "
+            "API (não há o que cobrar), então só as camadas listadas resolvem.",
+            default="Standard",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "skuName"),
+        ),
+        _field(
+            "longTermSupport",
+            "boolean",
+            False,
+            "Cobra o adicional de Long Term Support (suporte estendido de "
+            "versão do Kubernetes) em vez do Uptime SLA. São meters "
+            "diferentes, e o LTS é bem mais caro.",
+            default=False,
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "Standard")}
+    notas = [
+        "Precifica só o control plane. Os NÓS do cluster são VMs comuns — "
+        "resolva-os pelo serviço 'vm', com o armSkuName do node pool.",
+        "Sob o skuName 'Standard' convivem dois meters ('Uptime SLA' e 'Long "
+        "Term Support'); o resolver escolhe pelo campo longTermSupport.",
+        "AKS Automatic não é coberto: é outro produto, com meters próprios "
+        "('Automatic Hosted Control Plane' e um por categoria de nó).",
+    ]
+    return campos, exemplo, notas
+
+
+async def _fields_synapse(*, region, currency, sample_size, client):
+    """Campos do serverless SQL pool do Synapse.
+
+    O serviceName "Azure Synapse Analytics" cobre um catálogo heterogêneo
+    (Dedicated SQL Pool por DWU/hora, Spark Pool por vCore/hora, Pipelines por
+    operação, Storage por GB/mês, VMs de SSIS). O resolver cobre só o
+    serverless SQL pool, então o schema só promete esse tier — listar os
+    outros faria o agente montar config que o resolver recusa.
+    """
+    svc = _CATALOG["synapse"]
+    base_probe = {
+        "serviceName": svc.service_name,
+        "armRegionName": region,
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Confirma contra a API que o produto do resolver realmente existe na
+    # região, em vez de afirmar de cabeça.
+    tiers = [
+        tier
+        for tier, produto in SYNAPSE_TIERS.items()
+        if any(str(it.get("productName")) == produto for it in itens)
+    ]
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure. Aceita 'East US' ou 'eastus' — é normalizada.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Motor do Synapse. Só o serverless SQL pool tem resolver hoje.",
+            default="Serverless SQL Pool",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "productName"),
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "Serverless SQL Pool")}
+    notas = [
+        "Cobrado por TB PROCESSADO (volume consultado), não por hora nem por "
+        "capacidade armazenada: estimar exige usage['tbProcessed'].",
+        "Não há default de volume consultado — diferente de horas, onde 730 é "
+        "o mês cheio, aqui um default seria inventar a conta inteira.",
+        "O armazenamento do data lake é OUTRO serviço ('storage'): este meter "
+        "cobre só o motor de consulta sobre ele.",
+    ]
+    return campos, exemplo, notas
+
+
+async def _fields_sql_license(*, region, currency, sample_size, client):
+    """Campos da linha de LICENÇA do SQL Database.
+
+    Serviço "de apoio", não algo que se pede sozinho: o custo completo de um
+    banco é compute (serviço 'sql') + esta linha. Quem compõe os dois é
+    pricing.sql_monthly_cost, que já é o que estimate_monthly_cost usa para
+    'sql' — este schema existe para quem quiser ITEMIZAR a estimativa.
+    """
+    base_probe = {
+        "serviceName": "SQL Database",
+        "armRegionName": "Global",
+        "priceType": "Consumption",
+    }
+    itens = await _probe(base_probe, currency=currency, client=client)
+    regioes = await _regions(currency=currency, client=client)
+
+    # Confirma contra a API quais tiers têm linha de licença de fato.
+    tiers = [
+        tier
+        for tier, produto in SQL_LICENSE_PRODUCTS.items()
+        if any(str(it.get("productName")) == produto for it in itens)
+    ]
+
+    campos = [
+        _field(
+            "region",
+            "string",
+            True,
+            "Região Azure do banco. A licença é global — a região só decide "
+            "entre o meter comum e o de US Gov, que é mais caro.",
+            values=regioes,
+            sample=sample_size,
+            source=_source(_REGION_PROBE, "armRegionName"),
+        ),
+        _field(
+            "tier",
+            "string",
+            False,
+            "Camada de serviço do banco. Cada tier tem sua própria licença.",
+            default="General Purpose",
+            values=tiers,
+            sample=sample_size,
+            source=_source(base_probe, "productName"),
+        ),
+        _field(
+            "priceType",
+            "string",
+            False,
+            "Tipo de preço.",
+            default="Consumption",
+            values=_distinct(itens, "type"),
+            sample=sample_size,
+            source=_source(base_probe, "type"),
+        ),
+    ]
+    exemplo = {"region": region, "tier": _prefer(tiers, "General Purpose")}
+    notas = [
+        "Preço por vCore/HORA — diferente do meter de compute, cujo skuName já "
+        "embute a contagem ('2 vCore'). Multiplique pelo número de vCores.",
+        "O meter vive na pseudo-região 'Global': a licença não varia por "
+        "região comercial (só US Gov tem meter próprio).",
+        "Com Azure Hybrid Benefit (BYOL) esta linha não é cobrada — passe "
+        "licenseIncluded=False para o serviço 'sql'.",
+    ]
+    return campos, exemplo, notas
+
+
 _BUILDERS: dict[str, Callable] = {
     "vm": _fields_vm,
     "storage": _fields_storage,
     "sql": _fields_sql,
+    "aks": _fields_aks,
+    "synapse": _fields_synapse,
+    "sql_license": _fields_sql_license,
 }
 
 

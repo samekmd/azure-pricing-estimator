@@ -20,27 +20,6 @@ class PriceResult(BaseModel):
     price_type: str
 
 
-class AddLineItemResult(BaseModel):
-    """O que add_line_item conseguiu (ou não) aplicar na UI da calculadora.
-
-    Só é interessante no modo não-estrito: no estrito, um campo sem seletor
-    levanta NotImplementedError e nunca chega a virar resultado parcial.
-    """
-
-    service: str
-    applied_fields: list[str]
-    ignored_fields: list[str] = Field(default_factory=list)
-    """Campos sem seletor mapeado, pulados por strict=False (vazio no estrito).
-
-    Não-vazio significa que a estimativa na calculadora NÃO reflete toda a
-    config pedida — quem exporta o link precisa dizer isso ao usuário.
-    """
-
-    @property
-    def complete(self) -> bool:
-        return not self.ignored_fields
-
-
 class ServiceMatch(BaseModel):
     """Um serviço Azure candidato devolvido por search_azure_services."""
 
