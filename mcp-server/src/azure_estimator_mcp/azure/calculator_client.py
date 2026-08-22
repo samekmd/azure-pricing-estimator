@@ -11,7 +11,9 @@ autenticada) em 06/08. Preferência de estabilidade: `data-testid` > `name`/
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -200,15 +202,23 @@ class AzureCalculatorClient:
     A auth NÃO é renovada automaticamente: se a sessão expirou, is_authenticated
     retorna False e cabe a você rodar o bootstrap_login.py de novo. O ponto de
     usar navegador é justamente delegar a autenticação a ele.
+
+    Os passos que dependem da rede ou da hidratação da SPA passam por
+    _with_retry: contra uma UI real, um timeout isolado costuma ser
+    transitório. Sessão expirada, ao contrário, não é retentável.
     """
 
     def __init__(
         self,
         storage_state_path: str = ".auth/storage_state.json",
         headless: bool = True,
+        max_retries: int = 2,
+        backoff_base: float = 0.5,
     ) -> None:
         self.storage_state_path = Path(storage_state_path)
         self.headless = headless
+        self._max_retries = max_retries
+        self._backoff_base = backoff_base
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -240,6 +250,36 @@ class AzureCalculatorClient:
             await self._playwright.stop()
             self._playwright = None
 
+    async def _with_retry(
+        self, acao: Callable[[], Awaitable[Any]], descricao: str
+    ) -> Any:
+        """Executa `acao()` com retry e backoff exponencial em timeout da UI.
+
+        Mesma convenção do retry HTTP de retail_client.py
+        (`backoff_base * 2**tentativa`), pelo mesmo motivo: a falha típica é
+        transitória (rede, SPA lenta, painel que ainda não montou).
+
+        Só PlaywrightTimeoutError é retentado. CalculatorAuthError não é —
+        repetir numa sessão morta só multiplica a espera e atrasa a única
+        mensagem útil, a de refazer o bootstrap. ValueError/NotImplementedError
+        também passam direto: retry não conserta config inválida nem seletor
+        que mudou de nome.
+        """
+        last_exc: PlaywrightTimeoutError | None = None
+        for tentativa in range(self._max_retries + 1):
+            try:
+                return await acao()
+            except PlaywrightTimeoutError as exc:
+                last_exc = exc
+                if tentativa < self._max_retries:
+                    await asyncio.sleep(self._backoff_base * (2**tentativa))
+
+        assert last_exc is not None
+        raise PlaywrightTimeoutError(
+            f"{descricao}: falhou após {self._max_retries + 1} tentativas. "
+            f"Último erro: {last_exc}"
+        )
+
     async def is_authenticated(self) -> bool:
         """Reporta se a sessão carregada está logada NA CALCULADORA.
 
@@ -266,7 +306,10 @@ class AzureCalculatorClient:
 
         page = await self._context.new_page()
         try:
-            await page.goto(CALCULATOR_URL, wait_until="networkidle")
+            await self._with_retry(
+                lambda: page.goto(CALCULATOR_URL, wait_until="networkidle"),
+                "Carregar a calculadora",
+            )
             user_display = page.locator(_ACCOUNT_WIDGET)
             try:
                 await user_display.wait_for(state="visible", timeout=8000)
@@ -289,8 +332,12 @@ class AzureCalculatorClient:
                 "(async with AzureCalculatorClient() as client: ...)."
             )
 
-        self._page = await self._context.new_page()
-        await self._page.goto(CALCULATOR_URL, wait_until="networkidle")
+        page = await self._context.new_page()
+        self._page = page
+        await self._with_retry(
+            lambda: page.goto(CALCULATOR_URL, wait_until="networkidle"),
+            "Abrir a calculadora",
+        )
 
         # Banner de cookies (opcional — só aparece na primeira visita da
         # sessão de navegador). Rejeita não-essenciais por padrão.
@@ -607,15 +654,12 @@ class AzureCalculatorClient:
 
         page = self._page
         try:
-            await page.locator(
-                '[data-testid="stickyCostHeader__moreMenuButton"]'
-            ).click()
-            await page.locator('[data-testid="moreOptionsMenuList__share"]').click()
-
-            dialog = page.locator('.share-modal[role="dialog"]')
-            link_field = dialog.locator('textarea[name="link"]')
-            await link_field.wait_for(state="visible", timeout=10000)
-            link = await link_field.input_value()
+            # O retry fica DENTRO do try: só depois de esgotar as tentativas o
+            # timeout vira a mensagem de "layout mudou" — antes disso ainda
+            # pode ser lentidão passageira, que é o caso comum.
+            link = await self._with_retry(
+                self._open_share_dialog, "Export da estimativa"
+            )
         except PlaywrightTimeoutError as exc:
             # Cinto e suspensório: a checagem acima cobre o caso conhecido
             # (deslogado); isto cobre mudança de layout do menu/dialog, que
@@ -625,6 +669,26 @@ class AzureCalculatorClient:
                 "Se a sessão estiver válida, os seletores do menu Share podem "
                 f"ter mudado no layout da calculadora. Detalhe: {exc}"
             ) from exc
+
+        return link
+
+    async def _open_share_dialog(self) -> str:
+        """Uma tentativa do fluxo de share: abre o dialog, lê o link e fecha.
+
+        Fecha o dialog antes de devolver justamente para ser reexecutável: se
+        uma tentativa morrer no meio, a próxima encontra o menu no mesmo estado
+        em que começou.
+        """
+        page = self._page
+        assert page is not None
+
+        await page.locator('[data-testid="stickyCostHeader__moreMenuButton"]').click()
+        await page.locator('[data-testid="moreOptionsMenuList__share"]').click()
+
+        dialog = page.locator('.share-modal[role="dialog"]')
+        link_field = dialog.locator('textarea[name="link"]')
+        await link_field.wait_for(state="visible", timeout=10000)
+        link = await link_field.input_value()
 
         await dialog.get_by_role("button", name="Done").click()
         return link
