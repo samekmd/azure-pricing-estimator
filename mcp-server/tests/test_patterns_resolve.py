@@ -1,6 +1,6 @@
 """Validador pattern-driven: cada componente dos padrões da Skill vira um teste.
 
-Fonte de verdade: os YAMLs de .claude/skill/azure-arch-estimator/patterns/.
+Fonte de verdade: os YAMLs de .claude/skills/azure-arch-estimator/patterns/.
 Cada `components[]` de cada padrão é parametrizado como um caso INDEPENDENTE
 (id "padrao::componente"), para uma falha apontar exatamente qual componente
 de qual padrão quebrou — e não "os padrões quebraram".
@@ -41,7 +41,7 @@ from azure_estimator_mcp.azure.retail_client import BASE_URL, PAGE_SIZE, RetailP
 PATTERNS_DIR = (
     Path(__file__).resolve().parents[2]
     / ".claude"
-    / "skill"
+    / "skills"
     / "azure-arch-estimator"
     / "patterns"
 )

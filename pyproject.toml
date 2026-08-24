@@ -1,7 +1,7 @@
 [project]
 name = "azure-pricing-estimator"
 version = "0.1.0"
-description = "Estimador de preços do Azure com autenticação via Entra ID (MSAL)."
+description = "MCP que estima custos do Azure a preço público e gera links da calculadora de preços."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

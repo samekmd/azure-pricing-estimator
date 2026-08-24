@@ -9,3 +9,5 @@ payload.json
 
 instrucao_fase_1.md
 PROGRESS.md
+# Configuração local do Claude Code (aprovação de MCP por máquina)
+.claude/settings.local.json
