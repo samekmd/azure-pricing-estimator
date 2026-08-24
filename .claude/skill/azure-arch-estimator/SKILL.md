@@ -11,12 +11,12 @@ description: >
 
 # Azure Architecture Estimator
 
-> RASCUNHO (Fase 1/2). Este arquivo cobre o fluxo mínimo hoje possível:
-> interpretar → resolver preço → montar estimativa local. A geração do link
-> real da calculadora (`create_estimate` / `add_line_item` / `export_estimate`)
-> já tem lógica real em `calculator_client.py` (Playwright), mas os tools
-> correspondentes em `server.py` ainda não foram ligados a ela — ver
-> "Limitações atuais" no fim do arquivo. Os arquivos
+> Este arquivo descreve o fluxo completo: interpretar → resolver preço →
+> montar a estimativa e, quando possível, gerar o link real da calculadora
+> Azure via `create_estimate`/`add_line_item`/`export_estimate`
+> (`calculator_client.py`, Playwright). Nem todo componente entra no link
+> hoje — ver "Serviços com preço mas sem link" e "Limitações atuais" no
+> fim do arquivo. Os arquivos
 > `reference/interpretation-guide.md` e `reference/validation-rules.md`
 > aprofundam as regras de casamento de padrão e validação; aqui fica o
 > fluxo operacional, use os dois arquivos de referência quando precisar
@@ -31,13 +31,15 @@ de dados", esta Skill guia o agente (Claude Code) a:
    por palavra-chave).
 2. Se nenhum padrão casar, descobrir os componentes via `search_azure_services`
    e `get_service_config_schema` em vez de adivinhar (ver passo 2 do fluxo) —
-   hoje isso ainda cobre só os serviços com resolver implementado (`vm`,
-   `storage`, `sql`), então qualquer coisa fora dessas três continua
+   hoje isso cobre os serviços com resolver implementado (`vm`, `storage`,
+   `sql`, `aks`, `synapse`), então qualquer coisa fora dessas cinco continua
    sinalizada como bloqueada.
 3. Para cada componente, chamar as tools do MCP `azure-pricing-estimator`
    para resolver preço e projetar custo mensal.
-4. Somar os custos e apresentar a estimativa ao usuário em uma tabela,
-   deixando explícito quando algum componente não pôde ser precificado.
+4. Somar os custos, apresentar a estimativa ao usuário em uma tabela e,
+   quando possível, gerar o link real da calculadora Azure, deixando
+   explícito quando algum componente não pôde ser precificado ou não
+   entrou no link.
 
 ## Fluxo de trabalho
 
@@ -88,9 +90,10 @@ montar a config.
    que casou, útil para entender por que aquele serviço apareceu).
 
    - **Lista vazia** = a API não confirma nenhum serviço para esse termo
-     dentro do catálogo hoje (que cobre só `vm`, `storage`, `sql` — ver
-     "Serviços bloqueados"). Trate como bloqueado e sinalize ao usuário;
-     não invente uma `key` fora do que a tool devolveu.
+     dentro do catálogo hoje (que cobre `vm`, `storage`, `sql`, `aks` e
+     `synapse` — ver "Serviços com preço mas sem link"). Trate como
+     bloqueado e sinalize ao usuário; não invente uma `key` fora do que a
+     tool devolveu.
    - **Um resultado** → use a `key` dele.
    - **Mais de um resultado** → use o primeiro (maior score); se a
      descrição do usuário for ambígua a ponto de você não ter confiança
@@ -182,9 +185,12 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
 
 ### 4. Somar e apresentar a estimativa
 
-- Multiplique o custo mensal de cada componente pelo seu `quantity`. **Isso
-  ainda não é feito automaticamente pelo MCP** (`add_line_item` é stub) —
-  é responsabilidade da Skill somar na hora de apresentar o resultado.
+- Multiplique o custo mensal de cada componente pelo seu `quantity` para a
+  tabela que você apresenta. `resolve_price`/`estimate_monthly_cost`
+  devolvem valor por unidade — é responsabilidade da Skill multiplicar e
+  somar na hora de apresentar o resultado. Isso é independente do link da
+  calculadora, onde `add_line_item` já trata `quantity` sozinho (ver
+  abaixo).
 - Monte uma tabela: componente, papel, serviço, quantidade, custo
   unitário/mês, custo total/mês, e o total geral.
 - Deixe explícitas as premissas assumidas (região, tamanho de VM, volume de
@@ -192,10 +198,21 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
   essas premissas numa seção própria da resposta, por exemplo "Premissas
   assumidas:", com uma linha por componente, em vez de mencioná-las apenas
   como perguntas abertas ao final.
-- Informe que o resultado é uma **estimativa local**, não ainda um link da
-  calculadora Azure — a lógica de `create_estimate`/`add_line_item`/
-  `export_estimate` já existe em `calculator_client.py`, mas os tools do
-  MCP ainda não foram ligados a ela (ver limitações).
+- Antes de gerar o link, confira `check_calculator_auth()`. Se vier
+  `False`, a sessão expirou — informe isso ao usuário em vez de chamar
+  `create_estimate`/`export_estimate`, que vão falhar com
+  `CalculatorAuthError` de qualquer forma. A correção é rodar
+  `bootstrap_login.py` de novo; não há renovação automática.
+- Gere o link: `create_estimate()` uma vez, depois `add_line_item(service,
+  config, usage, quantity)` para cada componente, e por fim
+  `export_estimate()`. A resposta de `add_line_item` traz `assumptions`
+  (campos da UI que ficaram no default) e `unsupported` (o que não pôde
+  ser aplicado, ex.: `quantity` > 1 em `storage`, cujo painel não tem
+  campo de quantidade de contas) — mostre as duas listas ao usuário.
+- Componentes cujo `add_line_item` falhar com `ConfigTranslationError`
+  (hoje, `aks` e `synapse` — ver "Serviços com preço mas sem link") entram
+  no custo total apresentado, mas ficam de fora do link. Informe isso
+  explicitamente.
 
 > Checklist completo de autovalidação antes de apresentar a estimativa, e
 > a regra sobre o que pode virar valor numérico na resposta para
@@ -203,14 +220,20 @@ componente não pôde ser resolvido e por quê (ver "Erros esperados").
 
 ## Serviços suportados hoje
 
-Só estes três têm resolver funcional em `meters.py` — são os únicos que
-`resolve_price` consegue de fato precificar:
+Estes têm resolver funcional em `meters.py` — são os que `resolve_price`
+consegue de fato precificar:
 
 | service | Campos de `config` | Obrigatórios | Defaults |
 |---------|---------------------|--------------|----------|
 | `vm` | `armSkuName`, `region`, `windows`, `priceType` | `armSkuName`, `region` | `windows=false` (Linux), `priceType=Consumption` |
 | `storage` | `region`, `redundancy`, `tier`, `productName`, `priceType` | `region` | `redundancy=LRS`, `tier=Hot`, `productName=Blob Storage`, `priceType=Consumption` |
-| `sql` | `region`, `tier`, `compute`, `hardware`, `vCores`, `priceType` | `region` | `tier=General Purpose`, `compute=Provisioned`, `hardware=Gen5`, `priceType=Consumption` |
+| `sql` | `region`, `tier`, `compute`, `hardware`, `vCores`, `priceType`, `licenseIncluded` | `region`, `vCores` (se `licenseIncluded=True`) | `tier=General Purpose`, `compute=Provisioned`, `hardware=Gen5`, `priceType=Consumption`, `licenseIncluded=true` |
+| `aks` | `region`, `tier`, `longTermSupport`, `priceType` | `region` | `tier=Standard`, `longTermSupport=false`, `priceType=Consumption` |
+| `synapse` | `region`, `tier`, `priceType` | `region` | `tier=Serverless SQL Pool`, `priceType=Consumption` |
+
+`sql` agora compõe compute + licença automaticamente (`estimate_monthly_cost`
+já devolve o total certo). `licenseIncluded=false` corresponde a Azure
+Hybrid Benefit (BYOL), sem cobrança de licença.
 
 Campos de `usage` esperados por `monthly_cost` (conforme o `unit_of_measure`
 devolvido pela API — a Skill não escolhe isso, é o meter que dita):
@@ -219,29 +242,30 @@ devolvido pela API — a Skill não escolhe isso, é o meter que dita):
 |---|---|---|
 | `1 Hour` | `hours` | 730 (mês cheio) |
 | `1 GB` / `1 GB/Month` | `gb` | obrigatório, sem default |
+| `1 TB` | `tbProcessed` (ou `tb`) | obrigatório, sem default |
 | `1/Month` / `1 Month` | (nenhum) | custo fixo mensal |
+| `1/Day` / `1 Day` | (nenhum) | projetado ao mês |
 
 Qualquer outro `unit_of_measure` faz `monthly_cost` levantar erro — não é
 para a Skill tentar mapear na mão; é sinal de que falta suporte em
 `pricing.py`.
 
-## Serviços bloqueados (sem resolver ainda)
+## Serviços com preço mas sem link na calculadora
 
-- **`aks`** — SLA do control plane gerenciado do AKS. Usado no componente
-  `control-plane-sla` de `aks-microservices.yaml`. Nós do cluster (node
-  pool) **não** são bloqueados — são VMs normais, já cobertos por `vm`.
-- **`synapse`** — Azure Synapse Analytics (serverless SQL pool), usado no
-  componente `synapse-serverless-sql` de `data-lakehouse.yaml`. Cobrado por
-  TB processado, não por hora — quando o resolver existir, `usage` desse
-  componente provavelmente precisará de um campo tipo `tbProcessed` (ainda
-  não suportado por `monthly_cost`).
+- **`aks`** — resolve preço normalmente (SLA do control plane, componente
+  `control-plane-sla` de `aks-microservices.yaml`), mas `config_translate.py`
+  ainda não tem tradução de UI para ele. `add_line_item` recusa com
+  `ConfigTranslationError`. Nós do cluster (node pool) não têm esse
+  problema — são VMs normais, cobertas por `vm`.
+- **`synapse`** — mesma situação: preço resolve (`synapse-serverless-sql`
+  de `data-lakehouse.yaml`), mas sem tradução de UI ainda.
 
 Ao montar uma estimativa que inclua um destes, informe claramente ao
-usuário que aquele componente específico não tem preço disponível ainda,
-mas siga precificando o restante da arquitetura normalmente.
+usuário que o componente entra no custo total, mas fica de fora do link
+da calculadora.
 
-> Regras detalhadas de como tratar um componente bloqueado sem travar o
-> resto da estimativa estão em `reference/validation-rules.md`.
+> Regras detalhadas de como apresentar isso ao usuário sem confundir com
+> um componente sem preço nenhum estão em `reference/validation-rules.md`.
 
 ## Erros esperados
 
@@ -252,8 +276,13 @@ mas siga precificando o restante da arquitetura normalmente.
 - `ValueError` de `monthly_cost` — `unit_of_measure` do meter não tem
   mapeamento de uso conhecido. Reporte o componente como não estimável por
   enquanto.
-- Serviço fora de `vm`/`storage`/`sql` — trate como bloqueado (ver seção
-  acima), não como erro de config.
+- Serviço fora de `vm`/`storage`/`sql`/`aks`/`synapse` — trate como
+  bloqueado (não tem resolver de preço).
+- `ConfigTranslationError` em `add_line_item` — o componente tem preço mas
+  não entra no link da calculadora ainda (ver "Serviços com preço mas sem
+  link"). Não é erro de config, não tente contornar mudando valores.
+- `CalculatorAuthError` — sessão expirada. Não insista em `create_estimate`/
+  `export_estimate`; oriente o usuário a rodar `bootstrap_login.py`.
 
 > Detalhamento de cada causa de `PriceResolutionError` e como confirmar
 > valores fora da amostra truncada de um campo estão em
@@ -261,13 +290,12 @@ mas siga precificando o restante da arquitetura normalmente.
 
 ## Limitações atuais
 
-- `check_calculator_auth`, `create_estimate`, `add_line_item` e
-  `export_estimate` continuam levantando `NotImplementedError` em
-  `server.py` — mas a lógica real (Playwright) já existe nos métodos
-  correspondentes de `AzureCalculatorClient`, em `calculator_client.py`.
-  Falta só ligar os tools do MCP a ela (wiring), não implementar do zero.
-  Até isso acontecer, a Skill só consegue montar uma **estimativa local**
-  (soma de custos calculados), não gerar o link oficial da calculadora.
-- `quantity` dos componentes não é somado automaticamente por nenhuma tool
-  — a soma é feita pela Skill na hora de apresentar o resultado (passo 4).
-- Serviços `aks` e `synapse` não têm resolver — ver seção acima.
+- `aks` e `synapse` resolvem preço mas não entram no link da calculadora
+  ainda (`ConfigTranslationError` em `add_line_item`) — ver "Serviços com
+  preço mas sem link".
+- `quantity` dos componentes, no **custo total apresentado pela Skill**,
+  não é somado automaticamente por `resolve_price`/`estimate_monthly_cost`
+  (que devolvem valor por unidade) — a soma continua responsabilidade da
+  Skill (passo 4). Isso é diferente do link da calculadora: ali
+  `add_line_item` já traduz `quantity` para o campo de instâncias da UI
+  sozinho, exceto em `storage`, onde o painel não tem esse campo.

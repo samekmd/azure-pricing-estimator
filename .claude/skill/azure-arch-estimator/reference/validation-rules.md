@@ -28,18 +28,14 @@ Antes de mostrar a tabela final ao usuário, confira:
 2. Todo componente do padrão, ou do fallback, aparece na tabela, ou está explicitamente listado como bloqueado, com o motivo.
 3. A declaração de qual padrão casou, ou que caiu em fallback, aparece antes da tabela, não só no raciocínio interno.
 4. A seção "Premissas assumidas" está presente e cobre todo campo que recebeu um default sem pedido explícito do usuário.
-5. O aviso de que o resultado é uma estimativa local, não o link real da calculadora, está presente.
+5. O status do link está correto: se foi gerado, ele aparece; se algum componente ficou de fora por `ConfigTranslationError`, isso está sinalizado; se por sessão expirada ou erro só deu pra montar estimativa local, isso está dito explicitamente.
 6. Nenhum valor de campo escolhido fora da amostra truncada é apresentado sem indicar como foi confirmado, ver seção 2.
 
 ## 4. O que pode virar valor numérico na resposta
 
-**Decisão pendente de confirmação do time**, registrada aqui porque surgiu num teste real e ainda não foi formalizada.
+Esta seção nasceu de um caso real: antes de `aks` ter resolver de preço, o agente incluiu, para o componente `control-plane-sla`, um valor aproximado (~$0,10/hora) vindo de conhecimento geral, não de nenhuma chamada ao MCP. Isso não pode mais acontecer nesse caso específico: `aks` agora tem resolver real (ver `SKILL.md`, "Serviços suportados hoje"), então esse preço sempre vem da API.
 
-Ao montar a estimativa do padrão `aks-microservices`, o agente incluiu, para o componente bloqueado `control-plane-sla`, um valor aproximado de referência (~$0,10/hora) vindo de conhecimento geral, não de nenhuma chamada ao MCP. O valor é plausível, mas não é rastreável até a Retail Prices API, que é a garantia central do projeto.
-
-Regra proposta, até o time decidir o contrário: nenhum valor numérico apresentado na resposta pode vir de conhecimento geral do agente. Todo número precisa ser rastreável até uma chamada real ao MCP. Para componentes bloqueados, informe que não há preço disponível e pare por aí, sem número de referência, mesmo que aproximado e mesmo que correto.
-
-Se o time decidir que valores de referência aproximados são aceitáveis, desde que rotulados claramente como não verificados, atualize esta seção e remova o aviso de pendência.
+O princípio continua válido para qualquer serviço sem resolver: nenhum valor numérico apresentado na resposta pode vir de conhecimento geral do agente. Todo número precisa ser rastreável até uma chamada real ao MCP. Para componentes sem resolver, informe que não há preço disponível e pare por aí.
 
 ## 5. Tratamento consistente de serviço bloqueado
 
