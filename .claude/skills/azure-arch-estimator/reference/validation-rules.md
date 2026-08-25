@@ -37,13 +37,15 @@ Esta seção nasceu de um caso real: antes de `aks` ter resolver de preço, o ag
 
 O princípio continua válido para qualquer serviço sem resolver: nenhum valor numérico apresentado na resposta pode vir de conhecimento geral do agente. Todo número precisa ser rastreável até uma chamada real ao MCP. Para componentes sem resolver, informe que não há preço disponível e pare por aí.
 
-## 5. Tratamento consistente de serviço bloqueado
+## 5. Tratamento consistente de serviço sem preço
 
-Caso de referência real: padrão `aks-microservices`, componente `control-plane-sla` (serviço `aks`, sem resolver em `meters.py`).
+Caso de referência real: antes das correções do Samuel, o padrão `aks-microservices` tinha o componente `control-plane-sla` sem resolver nenhum.
 
-Regras:
+Regras, ainda válidas para qualquer serviço futuro sem resolver:
 
-- O bloqueio é por componente, não por padrão inteiro. `node-pool` (VMs normais) e `database` (SQL) do mesmo padrão continuam resolvíveis normalmente, mesmo com `control-plane-sla` bloqueado.
-- Ao encontrar um serviço fora de `vm`/`storage`/`sql`, trate como bloqueio esperado, não como erro de execução, ver `SKILL.md`, seção "Erros esperados".
-- A tabela final deve mostrar a linha do componente bloqueado explicitamente, com o motivo, em vez de simplesmente omitir a linha.
-- O total apresentado deve deixar claro que exclui o componente bloqueado, por exemplo "Total estimado: $X/mês (sem contar o componente Y, ver abaixo)", nunca um total que pareça completo sem sê-lo.
+- O bloqueio é por componente, não por padrão inteiro. Componentes com resolver funcional no mesmo padrão continuam resolvíveis normalmente, mesmo com outro componente sem preço.
+- Ao encontrar um serviço fora dos que têm resolver, trate como bloqueio esperado, não como erro de execução, ver `SKILL.md`, seção "Erros esperados".
+- A tabela final deve mostrar a linha do componente sem preço explicitamente, com o motivo, em vez de simplesmente omitir a linha.
+- O total apresentado deve deixar claro que exclui o componente sem preço, por exemplo "Total estimado: $X/mês (sem contar o componente Y, ver abaixo)", nunca um total que pareça completo sem sê-lo.
+
+Distinga isso do caso de "preço resolve mas sem link" (`aks`/`synapse` hoje, ver `SKILL.md`, "Serviços com preço mas sem link"): ali o componente entra no custo total normalmente, só fica de fora do link da calculadora. Não trate os dois casos com a mesma linguagem, um é ausência de preço, o outro é ausência de link.
