@@ -168,11 +168,60 @@ Três blocos de trabalho. As tarefas de cada fase foram distribuídas para rodar
 
 ---
 
+## Cronograma (04/09 – 18/09) — segunda entrega
+
+Duas frentes rodando **em paralelo**: enquanto Natália e Cauã redesenham a
+biblioteca de padrões (as 3 arquiteturas mapeadas de primeira mão na entrega
+anterior), Samuel, Arthur e André trazem o
+[AzurePricingMCP](https://github.com/msftnadavbh/AzurePricingMCP) — um MCP de
+comunidade para consulta de preços da Azure — para o repositório, adequam-no
+aos padrões de entrega do projeto e tentam integrá-lo ao MCP próprio
+(construído com Playwright).
+
+### Bloco 1 — Descoberta e planejamento · 07/09 – 11/09
+
+| Membro | Tarefa |
+|--------|--------|
+| **Natália** | Revisar os 3 padrões atuais (`three-tier-web-app`, `aks-microservices`, `data-lakehouse`) e levantar o que muda no redesenho (componentes desatualizados, lacunas) |
+| **Cauã** | Levantar referências de arquitetura para orientar as novas versões dos 3 padrões |
+| **Samuel** | Rodar o AzurePricingMCP localmente e mapear suas tools/capacidades |
+| **Arthur** | Comparar as tools do AzurePricingMCP com as do nosso MCP (`resolve_price`, `search_azure_services` etc.) e listar sobreposições/lacunas |
+| **André** | Levantar os padrões de entrega do projeto (estrutura de `mcp-server/`, testes, convenções) que o AzurePricingMCP precisa seguir para ser incorporado |
+
+### Bloco 2 — Execução · 14/09 – 16/09
+
+| Membro | Tarefa |
+|--------|--------|
+| **Natália** | Redesenhar os 3 padrões (novas versões dos YAMLs de arquitetura) |
+| **Cauã** | Validar os padrões redesenhados contra os resolvers existentes |
+| **Samuel** | Adequar o código do AzurePricingMCP à estrutura/testes do projeto |
+| **Arthur + André** | Primeira tentativa de integração entre o AzurePricingMCP e o MCP Playwright; comparar preços retornados por ambos para checar consistência |
+
+### Bloco 3 — Fechamento e entrega · 17/09 – 18/09
+
+| Membro | Tarefa |
+|--------|--------|
+| **Natália + Cauã** | Testar as arquiteturas redesenhadas ponta a ponta e atualizar a documentação da Skill/padrões |
+| **Samuel + Arthur + André** | Fechar a integração do AzurePricingMCP, corrigir bugs e preparar a demo |
+| **Todos** | Teste ponta a ponta da entrega, revisão final |
+
+### Dependências a vigiar
+
+- O redesenho de **Natália/Cauã** é independente da integração do MCP de
+  comunidade — as duas frentes correm em paralelo desde o dia 1.
+- A tentativa de integração (**Arthur + André**, Bloco 2) depende do
+  levantamento de tools do Bloco 1 (Arthur) e da adequação de padrões feita
+  por Samuel — por isso só começa na semana 2.
+
+---
+
 ## Equipe
 
 - **Samuel** — núcleo de preço, integração das tools, documentação
 - **André** — servidor MCP, automação do navegador (export)
 - **Natália** — Skill, biblioteca de padrões, testes de ponta a ponta
+- **Arthur** — integração do MCP de comunidade (AzurePricingMCP) com o MCP próprio
+- **Cauã** — redesenho da biblioteca de padrões de arquitetura
 
 ## Segurança
 
