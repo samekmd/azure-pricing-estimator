@@ -1,0 +1,60 @@
+# Padrão de arquitetura: Data Lakehouse (Azure-native)
+#
+# Motor de consulta/processamento Azure Synapse Analytics (serverless
+# SQL pool): serviço Azure nativo, de preço público
+#
+# STATUS: os 2 componentes resolvem PREÇO (21/08). data-lake-storage usa o
+# resolver "storage"; synapse-serverless-sql passou a ter resolver próprio
+# ("synapse" em meters.py), que isola o meter "Standard Data Processed" do
+# produto "Azure Synapse Analytics Serverless SQL Pool" — cobrado por TB
+# PROCESSADO ($5/TB em eastus), não por hora.
+#
+# RESSALVA da fatia vertical: o "synapse" ainda NÃO tem tradução para a UI da
+# calculadora (config_translate.py). Entra no custo estimado, mas não no link
+# da calculadora; add_line_item recusa com ConfigTranslationError.
+
+pattern:
+  id: data-lakehouse
+  name: "Data Lakehouse (Azure-native)"
+  description: >
+    Arquitetura de dados em camadas (medalhão: Bronze/Silver/Gold) usando
+    apenas serviços Azure nativos de preço público: Data Lake (ADLS Gen2)
+    para armazenamento e Azure Synapse Analytics (serverless SQL pool) como
+    motor de consulta/processamento sobre os dados. Sem Databricks.
+  match:
+    keywords:
+      - "data lake"
+      - "lakehouse"
+      - "synapse"
+      - "bronze silver gold"
+      - "medalhão"
+      - "pipeline de dados"
+      - "arquitetura de dados"
+
+components:
+  - id: data-lake-storage
+    role: "Data Lake (ADLS Gen2) — camadas Bronze/Silver/Gold"
+    service: storage
+    quantity: 1
+    config:
+      region: East US
+      redundancy: LRS
+      tier: Hot
+      priceType: Consumption
+    usage:
+      gb: 1000  # estimativa inicial de volume armazenado, editável
+
+  - id: synapse-serverless-sql
+    role: "Motor de consulta/processamento (T-SQL sob demanda sobre o data lake)"
+    service: synapse  # resolve preço; sem tradução para a UI da calculadora ainda
+    quantity: 1
+    config:
+      # Confirmado contra a Retail Prices API em 21/08: serviceName "Azure
+      # Synapse Analytics", productName "Azure Synapse Analytics Serverless
+      # SQL Pool", meter "Standard Data Processed", $5,00 por 1 TB em eastus.
+      # Cobrado por TB processado, não por hora — por isso o "usage" abaixo é
+      # volume consultado/mês.
+      region: East US
+      tier: "Serverless SQL Pool"
+    usage:
+      tbProcessed: 5  # estimativa inicial de volume consultado/mês, editável

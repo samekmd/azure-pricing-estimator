@@ -1,11 +1,12 @@
 [project]
 name = "azure-pricing-estimator"
 version = "0.1.0"
-description = "Estimador de preços do Azure com autenticação via Entra ID (MSAL)."
+description = "MCP que estima custos do Azure a preço público e gera links da calculadora de preços."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28.1",
+    "mcp[cli]>=2.0.0",
     "msal>=1.37.0",
     "playwright>=1.61.0",
     "pydantic>=2.13.4",
@@ -18,6 +19,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
+    "pyyaml>=6.0.2",
 ]
 
 [tool.pytest.ini_options]
@@ -25,4 +27,12 @@ testpaths = ["mcp-server/tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: testes que batem na API real (pulados sem rede)",
+    "browser: testes que abrem a calculadora num Chromium real (sem efeito colateral; não exigem sessão)",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp-server/src/azure_estimator_mcp"]

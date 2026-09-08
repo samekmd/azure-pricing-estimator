@@ -1,0 +1,76 @@
+# Padrão de arquitetura: Microsserviços em AKS
+#
+# STATUS: os 4 componentes resolvem PREÇO (21/08). database e shared-storage
+# usam o vocabulário real de meters.py (sql, storage); o node-pool reaproveita
+# o resolver "vm" (nodes do AKS são VMs normais, cobradas por vCore/hora); e o
+# control-plane-sla passou a ter resolver próprio ("aks" em meters.py), que
+# isola o meter "Standard Uptime SLA" do serviceName "Azure Kubernetes
+# Service".
+#
+# RESSALVA da fatia vertical: o "aks" ainda NÃO tem tradução para a UI da
+# calculadora (config_translate.py) — o painel do serviço não foi mapeado.
+# Então este componente entra no custo estimado, mas não pode ser adicionado
+# ao link da calculadora; add_line_item recusa com ConfigTranslationError.
+
+pattern:
+  id: aks-microservices
+  name: "Microsserviços em AKS"
+  description: >
+    Aplicação de microsserviços rodando em cluster Azure Kubernetes Service
+    (AKS), com banco de dados gerenciado e armazenamento compartilhado para
+    artefatos, imagens de container e logs.
+  match:
+    keywords:
+      - "microsserviços"
+      - "microservices"
+      - "kubernetes"
+      - "aks"
+      - "containers"
+      - "arquitetura de containers"
+
+components:
+  - id: node-pool
+    role: "Node pool do cluster (VMs que executam os pods)"
+    service: vm  # nodes AKS são VMs normais 
+    quantity: 3
+    config:
+      armSkuName: Standard_D4s_v3
+      region: East US
+      windows: false
+      priceType: Consumption
+    usage:
+      hours: 730
+
+  - id: control-plane-sla
+    role: "SLA do control plane gerenciado (camada Standard/paga)"
+    service: aks  # resolve preço; sem tradução para a UI da calculadora ainda
+    quantity: 1
+    config:
+      region: East US
+      tier: Standard  
+    usage: {}
+
+  - id: database
+    role: "Banco de dados gerenciado"
+    service: sql
+    quantity: 1
+    config:
+      region: East US
+      tier: General Purpose
+      compute: Provisioned
+      hardware: Gen5
+      vCores: 2
+      priceType: Consumption
+    usage: {}
+
+  - id: shared-storage
+    role: "Armazenamento compartilhado (artefatos, imagens, logs)"
+    service: storage
+    quantity: 1
+    config:
+      region: East US
+      redundancy: LRS
+      tier: Hot
+      priceType: Consumption
+    usage:
+      gb: 200

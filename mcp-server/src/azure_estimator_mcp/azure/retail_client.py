@@ -33,14 +33,65 @@ _REGION_MAP = {
 }
 
 
+# Pseudo-regiões: valores de armRegionName que NÃO são slugs de região comercial.
+# A API os devolve com capitalização e espaços significativos ("Global", "US Gov",
+# "Zone 1") e o $filter é case-sensitive: `armRegionName eq 'global'` casa ZERO
+# itens e volta vazio, sem erro. Como o lower+replace do fallback genérico produz
+# exatamente essa forma, todo serviço sem região comercial (Load Balancer,
+# bandwidth/egress, DNS, CDN, Traffic Manager...) sumia silenciosamente da
+# resolução e da enumeração do catálogo — o pior modo de falha do projeto.
+#
+# Por isso essas regiões são exceção: a allowlist abaixo é consultada ANTES do
+# lower+replace e devolve a grafia canônica que a API aceita. A chave é a forma
+# normalizada (minúscula, sem espaços), então tanto "Global" quanto "global"
+# quanto "GLOBAL" chegam ao mesmo canônico.
+#
+# Grafias confirmadas por sondagem da própria API (distintos de armRegionName),
+# não por suposição. Nota: NÃO existe "US DoD" como armRegionName — as regiões
+# DoD/Gov reais vêm como slug comum ("usdodeast", "usgovvirginia", "usgovtexas")
+# e continuam sendo tratadas pelo caminho comercial.
+_SPECIAL_REGIONS = (
+    "Global",
+    "US Gov",
+    "US Gov Zone 1",
+    "US Gov Zone 2",
+    "Zone 1",
+    "Zone 2",
+    "Zone 3",
+    "Zone 4",
+    "Zone 5",
+    "Zone 6",
+    "Intercontinental",
+    # Pseudo-regiões continentais usadas por meters de banda/egress.
+    "Asia",
+    "Europe",
+    "India",
+    "Middle East And Africa",
+    "North America",
+    "Oceania",
+    "South America",
+)
+
+# forma normalizada -> grafia canônica esperada pela API.
+_SPECIAL_REGION_MAP = {r.lower().replace(" ", ""): r for r in _SPECIAL_REGIONS}
+
+
 def normalize_region(region: str) -> str:
     """Normaliza um nome de região para o formato armRegionName.
 
     "East US" -> "eastus". Aceita tanto o nome amigável quanto o já-normalizado.
+
+    Pseudo-regiões não-comerciais ("Global", "US Gov", "Zone 1"...) são
+    preservadas na capitalização exata que o $filter da API exige — ver
+    _SPECIAL_REGIONS. Sem isso a consulta casaria zero itens em silêncio.
     """
     if not region:
         return region
     key = region.strip().lower()
+    # Antes de qualquer slugify: pseudo-regiões mantêm a grafia canônica.
+    special = _SPECIAL_REGION_MAP.get(key.replace(" ", ""))
+    if special is not None:
+        return special
     if key in _REGION_MAP:
         return _REGION_MAP[key]
     # Fallback genérico: remove espaços (cobre regiões fora do mapa mínimo).
@@ -52,7 +103,9 @@ def build_filter(filters: dict[str, str]) -> str:
 
     Cada par vira `campo eq 'valor'`, unidos por ` and `. Aspas simples no valor
     são escapadas dobrando-as, como manda o OData. A região, se presente, é
-    normalizada aqui (armRegionName é minúsculo e sem espaços).
+    normalizada aqui: regiões comerciais viram slug minúsculo sem espaços
+    ("East US" -> "eastus"), pseudo-regiões mantêm a grafia canônica da API
+    ("Global", "US Gov") — ver normalize_region.
     """
     parts: list[str] = []
     for field, value in filters.items():
@@ -117,47 +170,44 @@ class RetailPricesClient:
         raise last_exc
 
     async def query_prices(
-        self, filters: dict[str, str], currency: str = "USD"
+        self, filters: dict[str, str], currency: str = "USD", top: int | None = None
     ) -> list[dict]:
         """Consulta todos os itens que casam com `filters`, com paginação completa.
 
-        Segue NextPageLink quando presente; MAS há um bug conhecido em que o link
-        volta vazio. Contorno: se a página veio cheia (PAGE_SIZE itens), geramos a
-        próxima nós mesmos com $skip incrementado, até vir menos que PAGE_SIZE.
+        A paginação é dirigida SEMPRE por $skip, derivado do total de itens já
+        acumulados — nunca por NextPageLink. O link é conhecido por voltar vazio
+        de forma intermitente; usá-lo como controle de fluxo criava dois modos de
+        avanço (link e $skip) que dessincronizavam entre si e refaziam páginas.
+        Com uma fonte única de verdade (`len(items)`), a mistura deixa de existir.
+
+        Condição de parada: página com menos de PAGE_SIZE itens.
+
+        `top` limita a consulta a N itens (sondas baratas de descoberta): manda
+        $top para a API e trunca localmente, então o limite vale mesmo quando a
+        API ignora o parâmetro.
         """
         odata_filter = build_filter(filters)
-        params = {
+        base_params = {
             "api-version": API_VERSION,
             "currencyCode": currency,
             "$filter": odata_filter,
         }
+        if top is not None:
+            base_params["$top"] = str(min(top, PAGE_SIZE))
 
         items: list[dict] = []
-        skip = 0
-        url: str | None = BASE_URL
-        # Na primeira chamada usamos params; ao seguir NextPageLink, a URL já
-        # traz a query string, então params vira None.
-        current_params: dict[str, str] | None = params
+        while True:
+            params = dict(base_params)
+            if items:
+                # A primeira chamada vai sem $skip; as seguintes retomam
+                # exatamente de onde a anterior parou.
+                params["$skip"] = str(len(items))
 
-        while url is not None:
-            data = await self._get(url, current_params)
+            data = await self._get(BASE_URL, params)
             page = data.get("Items", [])
             items.extend(page)
 
-            next_link = data.get("NextPageLink")
-            if next_link:
-                url = next_link
-                current_params = None
-                continue
-
-            # Sem NextPageLink: só continuamos se a página veio cheia (contorno
-            # do bug). Página incompleta => acabou de verdade.
-            if len(page) == PAGE_SIZE:
-                skip += PAGE_SIZE
-                url = BASE_URL
-                current_params = {**params, "$skip": str(skip)}
-                continue
-
-            url = None
-
-        return items
+            if top is not None and len(items) >= top:
+                return items[:top]
+            if len(page) < PAGE_SIZE:
+                return items
